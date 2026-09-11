@@ -1,0 +1,11 @@
+# Phase 0/1 dependencies (Windows-only for now — WASAPI loopback)
+PyAudioWPatch>=0.2.12.7
+
+# Added in later phases (Phase 2/3) — listed now so the venv is ready:
+faster-whisper>=1.0.0
+silero-vad>=5.1
+torch>=2.1.0        # CUDA build — install separately per pytorch.org for your CUDA version
+numpy>=1.26.0
+
+# Added in Phase 5/6 (GUI):
+# PyQt6>=6.6.0 # Installing it via pip causes issues. Instead we use conda-forge to install PyQt6.
