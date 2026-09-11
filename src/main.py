@@ -1,12 +1,3 @@
-"""
-Phase 6 & 7 — Integrated Subtitle Overlay Application.
-Features:
-- Native Windows OS click-through toggling (WS_EX_TRANSPARENT).
-- Handle drag/positioning with auto/manual click-through mode.
-- Auto-hiding subtitles after 4 seconds of silence.
-- Clean application lifecycle and thread termination.
-"""
-
 import ctypes
 import queue
 import sys

@@ -1,3 +1,5 @@
+
+
 import queue
 import threading
 import time
@@ -19,15 +21,11 @@ class AudioPipeline:
         self.model_size = model_size
         self.vad_threshold = vad_threshold
 
-        # Pipelines Queues
         self.audio_queue = queue.Queue()
         self.asr_queue = queue.Queue()
-        self.text_queue = queue.Queue()  # Thread-safe Queue B for output consumption
+        self.text_queue = queue.Queue()
 
-        # Thread Control Flag
         self._stop_event = threading.Event()
-
-        # Handles
         self._vad_thread = None
         self._asr_thread = None
         self._audio_stream = None
@@ -44,7 +42,7 @@ class AudioPipeline:
         raise RuntimeError("Could not find a matching WASAPI loopback device.")
 
     def _asr_worker(self):
-        print(f"[Pipeline] Loading Faster-Whisper model '{self.model_size}' (int8)...")
+        print("[Pipeline] Loading Faster-Whisper model...")
         model = WhisperModel(self.model_size, device="cuda", compute_type="int8")
         print("[Pipeline] ASR Worker ready.")
 
@@ -140,7 +138,6 @@ class AudioPipeline:
                     utterance_buffer = []
 
     def start(self):
-        """Starts audio capture, VAD, and ASR threads."""
         self._stop_event.clear()
         self._pyaudio_instance = pyaudio.PyAudio()
         device = self._get_default_loopback_device(self._pyaudio_instance)
@@ -155,8 +152,9 @@ class AudioPipeline:
         self._vad_thread.start()
 
         def callback(in_data, frame_count, time_info, status):
-            if not self._stop_event.is_set():
-                self.audio_queue.put(in_data)
+            if self._stop_event.is_set():
+                return (None, pyaudio.paComplete)
+            self.audio_queue.put(in_data)
             return (in_data, pyaudio.paContinue)
 
         self._audio_stream = self._pyaudio_instance.open(
@@ -171,31 +169,27 @@ class AudioPipeline:
         print("[Pipeline] System Audio Subtitle Pipeline started.")
 
     def stop(self):
-        """Stops all threads and terminates audio streams safely."""
+        if self._stop_event.is_set():
+            return
         print("[Pipeline] Stopping audio pipeline...")
         self._stop_event.set()
 
         if self._audio_stream:
-            self._audio_stream.stop_stream()
-            self._audio_stream.close()
+            try:
+                self._audio_stream.stop_stream()
+                self._audio_stream.close()
+            except Exception:
+                pass
 
         if self._pyaudio_instance:
-            self._pyaudio_instance.terminate()
-
-        print("[Pipeline] Pipeline stopped.")
-
-
-if __name__ == "__main__":
-    pipeline = AudioPipeline(model_size="base")
-    pipeline.start()
-
-    print("Pipeline running headless. Press Ctrl+C to stop...\n")
-    try:
-        while True:
             try:
-                text, latency = pipeline.text_queue.get(timeout=0.1)
-                print(f"[{latency:.2f}s] {text}")
-            except queue.Empty:
+                self._pyaudio_instance.terminate()
+            except Exception:
                 pass
-    except KeyboardInterrupt:
-        pipeline.stop()
+
+        if self._vad_thread and self._vad_thread.is_alive():
+            self._vad_thread.join(timeout=1.0)
+        if self._asr_thread and self._asr_thread.is_alive():
+            self._asr_thread.join(timeout=1.0)
+
+        print("[Pipeline] Pipeline stopped successfully.")
