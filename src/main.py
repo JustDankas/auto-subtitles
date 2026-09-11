@@ -1,9 +1,13 @@
 """
-Phase 6 — Full Pipeline & Overlay Integration.
-Connects the AudioPipeline (WASAPI -> Silero VAD -> Faster-Whisper)
-to the PyQt6 translucent overlay window using a main-thread QTimer.
+Phase 6 & 7 — Integrated Subtitle Overlay Application.
+Features:
+- Native Windows OS click-through toggling (WS_EX_TRANSPARENT).
+- Handle drag/positioning with auto/manual click-through mode.
+- Auto-hiding subtitles after 4 seconds of silence.
+- Clean application lifecycle and thread termination.
 """
 
+import ctypes
 import queue
 import sys
 
@@ -14,18 +18,37 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
 
 from audio_pipeline import AudioPipeline
 
+# --- Windows Native API Constants ---
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_LAYERED = 0x00080000
+
+
+def set_native_click_through(hwnd: int, enable: bool):
+    """Sets or unsets Windows WS_EX_TRANSPARENT flag for OS-level click passthrough."""
+    if sys.platform != "win32":
+        return
+    try:
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if enable:
+            style |= WS_EX_TRANSPARENT
+        else:
+            style &= ~WS_EX_TRANSPARENT
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    except Exception as e:
+        print(f"Error updating native window styles: {e}")
+
 
 class DragHandle(QFrame):
-    """Small visible handle widget used to position and interact with the overlay."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("""
             QFrame {
-                background-color: rgba(40, 40, 40, 200);
+                background-color: rgba(30, 30, 30, 220);
                 border-radius: 4px;
             }
             QFrame:hover {
-                background-color: rgba(70, 70, 70, 230);
+                background-color: rgba(60, 60, 60, 240);
             }
         """)
 
@@ -36,6 +59,7 @@ class SubtitleOverlayApp(QMainWindow):
         self.pipeline = pipeline
         self.is_dragging = False
         self.drag_start_position = QPoint()
+        self.is_native_passthrough = False
 
         self._init_window_flags()
         self._init_ui()
@@ -48,7 +72,6 @@ class SubtitleOverlayApp(QMainWindow):
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
     def _init_ui(self):
         self.resize(800, 150)
@@ -61,7 +84,7 @@ class SubtitleOverlayApp(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(10, 5, 10, 10)
 
-        # --- Top Bar Controls ---
+        # --- Top Control Bar ---
         top_bar_layout = QHBoxLayout()
         top_bar_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -94,7 +117,7 @@ class SubtitleOverlayApp(QMainWindow):
         top_bar_layout.addWidget(self.handle)
         top_bar_layout.addStretch()
 
-        # --- Subtitle Text Display ---
+        # --- Subtitle Label ---
         self.subtitle_label = QLabel("Listening for audio...", self)
         self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.subtitle_label.setWordWrap(True)
@@ -103,7 +126,7 @@ class SubtitleOverlayApp(QMainWindow):
                 color: #FFFFFF;
                 font-size: 22px;
                 font-weight: bold;
-                background-color: rgba(0, 0, 0, 160);
+                background-color: rgba(0, 0, 0, 170);
                 border-radius: 8px;
                 padding: 10px 15px;
             }
@@ -113,45 +136,56 @@ class SubtitleOverlayApp(QMainWindow):
         layout.addWidget(self.subtitle_label, stretch=1)
 
     def _init_timers(self):
-        # Poll cursor to handle window drag vs click-through
+        # Poll hover state to dynamically update native Windows click-through
         self.hover_timer = QTimer(self)
         self.hover_timer.setInterval(50)
         self.hover_timer.timeout.connect(self._check_hover_state)
         self.hover_timer.start()
 
-        # Poll Queue B for transcription results (Qt main thread safe)
+        # Poll Queue B for new transcription text
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(50)
         self.poll_timer.timeout.connect(self._poll_subtitles)
         self.poll_timer.start()
+
+        # Auto-hide timer: clears text after 4s of silence
+        self.autohide_timer = QTimer(self)
+        self.autohide_timer.setInterval(4000)
+        self.autohide_timer.setSingleShot(True)
+        self.autohide_timer.timeout.connect(self._clear_subtitles)
 
     def _check_hover_state(self):
         if self.is_dragging:
             return
 
         cursor_pos = QCursor.pos()
-        handle_global_rect = QRect(
+        handle_rect = QRect(
             self.handle.mapToGlobal(QPoint(0, 0)),
             self.handle.size()
         )
 
-        is_over_handle = handle_global_rect.contains(cursor_pos)
-        current_passthrough = self.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        is_over_handle = handle_rect.contains(cursor_pos)
+        hwnd = int(self.winId())
 
-        if is_over_handle and current_passthrough:
-            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        elif not is_over_handle and not current_passthrough:
-            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        if is_over_handle and self.is_native_passthrough:
+            set_native_click_through(hwnd, False)
+            self.is_native_passthrough = False
+        elif not is_over_handle and not self.is_native_passthrough:
+            set_native_click_through(hwnd, True)
+            self.is_native_passthrough = True
 
     def _poll_subtitles(self):
-        """Pulls generated transcriptions from Queue B and updates the UI."""
         while not self.pipeline.text_queue.empty():
             try:
                 text, _ = self.pipeline.text_queue.get_nowait()
                 if text:
                     self.subtitle_label.setText(text)
+                    self.autohide_timer.start()  # Reset 4s auto-hide countdown
             except queue.Empty:
                 break
+
+    def _clear_subtitles(self):
+        self.subtitle_label.setText("")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -170,24 +204,24 @@ class SubtitleOverlayApp(QMainWindow):
             event.accept()
 
     def closeEvent(self, event):
-        """Safely shut down background audio and ASR threads."""
+        self.hover_timer.stop()
+        self.poll_timer.stop()
+        self.autohide_timer.stop()
         self.pipeline.stop()
         event.accept()
+        QApplication.quit()
 
 
 def main():
     app = QApplication(sys.argv)
 
-    # Instantiate and start the audio pipeline
     pipeline = AudioPipeline(model_size="base")
     pipeline.start()
 
     overlay = SubtitleOverlayApp(pipeline)
     overlay.show()
 
-    # Register application quit hook
     app.aboutToQuit.connect(pipeline.stop)
-
     sys.exit(app.exec())
 
 
