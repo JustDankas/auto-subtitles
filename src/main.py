@@ -1,24 +1,16 @@
-"""
-Phase 7 — Natural Subtitle Rendering Engine.
-Features:
-- Sentence boundary detection via ASR punctuation (. ! ?) and capitalization.
-- Configurable multi-line buffer with line-by-line time decay.
-- Overflow wrapping based on configurable character thresholds.
-- Isolated OverlayConfig dataclass for easy parameter tuning.
-- Native Windows click-through toggling (WS_EX_TRANSPARENT).
-"""
-
 import ctypes
 import queue
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect, Qt,
+                          QTimer)
 from PyQt6.QtGui import QCursor
-from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
-                             QMainWindow, QPushButton, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect,
+                             QHBoxLayout, QLabel, QMainWindow, QPushButton,
+                             QVBoxLayout, QWidget)
 
 from audio_pipeline import AudioPipeline
 
@@ -28,30 +20,20 @@ WS_EX_TRANSPARENT = 0x00000020
 
 @dataclass
 class OverlayConfig:
-    """Central configuration panel for tuning subtitle layout and timing."""
-    # --- Line & Word Limits ---
-    # NOTE: as of the partial/final ASR pipeline, each utterance_id maps to
-    # exactly one on-screen line and QLabel's word-wrap handles overflow, so
-    # the fields below are no longer read anywhere. Left in place so existing
-    # config calls don't break; safe to delete once you've confirmed you
-    # don't want them back for some other purpose.
-    max_chars_per_line: int = 50          # unused (deprecated)
-    max_visible_lines: int = 3            # still used — caps stacked lines on screen
-    min_chars_before_cap_split: int = 12  # unused (deprecated)
+    """Central configuration panel for tuning subtitle layout and animation behavior."""
+    max_visible_lines: int = 3            # Caps active stacked lines on screen
 
-    # --- Timers & Decay ---
-    line_expiry_seconds: float = 3.0      # How long a completed top line remains before disappearing
-    silence_autohide_seconds: float = 5.0 # Complete silence duration before clearing all text
-
-    # --- ASR Sentence Parsing Rules (unused/deprecated, see note above) ---
-    split_on_punctuation: bool = True
-    split_on_capitalization: bool = True
-    punctuation_marks: tuple = ('.', '!', '?', '…')
+    # --- Timers & Dynamic Decay ---
+    base_line_expiry: float = 1.8         # Minimum duration a completed line remains (seconds)
+    seconds_per_word: float = 0.22        # Additional display time granted per word
+    silence_autohide_seconds: float = 5.0 # Complete silence duration before clearing all lines
 
     # --- Visual Style ---
     font_size: int = 20                   # Subtitle font size in pixels
     bg_opacity: int = 180                 # Background opacity (0 = transparent, 255 = solid)
     text_color: str = "#FFFFFF"           # Hex text color
+    line_spacing: int = 6                 # Pixel gap between stacked line bubbles
+    fade_duration_ms: int = 300           # Fade-out animation length in milliseconds
 
 
 def set_native_click_through(hwnd: int, enable: bool):
@@ -92,10 +74,13 @@ class SubtitleOverlayApp(QMainWindow):
         self.drag_start_position = QPoint()
         self.is_native_passthrough = False
 
-        # Active lines tracking: List[Dict{"text": str, "completed_at": float|None, "utterance_id": int|None}]
+        # Active lines tracking list:
+        # Each entry: {"utterance_id": int, "label": QLabel, "completed_at": Optional[float],
+        #              "expiry_duration": float, "fading": bool, "anim": Optional[QPropertyAnimation]}
         self.lines: List[Dict] = []
-        self.current_utterance_id = None  # the utterance_id still being updated in place, if any
+        self.current_utterance_id: Optional[int] = None
         self.last_audio_activity_time = time.time()
+        self.placeholder_label: Optional[QLabel] = None
 
         self._init_window_flags()
         self._init_ui()
@@ -110,16 +95,17 @@ class SubtitleOverlayApp(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def _init_ui(self):
-        self.resize(850, 180)
-        self.setMinimumSize(400, 100)
+        self.resize(850, 220)
+        self.setMinimumSize(400, 120)
 
         central_widget = QWidget(self)
         central_widget.setStyleSheet("background: transparent;")
         self.setCentralWidget(central_widget)
 
-        layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(10, 5, 10, 10)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 5, 10, 10)
 
+        # Top Bar (Drag handle and close button)
         top_bar_layout = QHBoxLayout()
         top_bar_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -151,24 +137,39 @@ class SubtitleOverlayApp(QMainWindow):
         top_bar_layout.addStretch()
         top_bar_layout.addWidget(self.handle)
         top_bar_layout.addStretch()
+        main_layout.addLayout(top_bar_layout)
 
-        self.subtitle_label = QLabel("Listening for audio...", self)
-        self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.subtitle_label.setWordWrap(True)
-        self.subtitle_label.setStyleSheet(f"""
+        # Subtitle Lines Container
+        self.lines_container = QWidget(self)
+        self.lines_container.setStyleSheet("background: transparent;")
+        self.lines_layout = QVBoxLayout(self.lines_container)
+        self.lines_layout.setContentsMargins(5, 5, 5, 5)
+        self.lines_layout.setSpacing(self.config.line_spacing)
+        self.lines_layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+        main_layout.addWidget(self.lines_container, stretch=1)
+
+        # Initial Placeholder Indicator
+        self.placeholder_label = self._create_line_label("Listening for audio...")
+        self.lines_layout.addWidget(self.placeholder_label)
+
+    def _create_line_label(self, initial_text: str = "") -> QLabel:
+        """Creates a standardized, left-aligned subtitle label bubble."""
+        label = QLabel(initial_text, self.lines_container)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setStyleSheet(f"""
             QLabel {{
                 color: {self.config.text_color};
                 font-size: {self.config.font_size}px;
                 font-weight: bold;
                 background-color: rgba(0, 0, 0, {self.config.bg_opacity});
-                border-radius: 8px;
-                padding: 10px 15px;
-                line-height: 130%;
+                border-radius: 6px;
+                padding: 6px 12px;
+                line-height: 125%;
             }}
         """)
-
-        layout.addLayout(top_bar_layout)
-        layout.addWidget(self.subtitle_label, stretch=1)
+        return label
 
     def _init_timers(self):
         # Poll hover state for OS click-through
@@ -179,7 +180,7 @@ class SubtitleOverlayApp(QMainWindow):
 
         # Engine tick: polls queue & manages line lifecycle
         self.engine_timer = QTimer(self)
-        self.engine_timer.setInterval(40)
+        self.engine_timer.setInterval(30)
         self.engine_timer.timeout.connect(self._engine_tick)
         self.engine_timer.start()
 
@@ -203,87 +204,112 @@ class SubtitleOverlayApp(QMainWindow):
             set_native_click_through(hwnd, True)
             self.is_native_passthrough = True
 
-    def _process_incoming_update(self, text: str, is_final: bool, utterance_id: int):
-        """
-        Handles both interim (partial) and final ASR results for a given
-        utterance_id. A partial replaces the in-place text of the line
-        currently being built; a final locks that line's text and starts
-        its decay timer. NOTE: with segment-level (not fragment-level)
-        ASR output, the old punctuation/capitalization chunk-merging logic
-        is no longer needed — QLabel's word wrap handles line breaking,
-        and each utterance_id maps to exactly one on-screen line.
-        """
-        self.last_audio_activity_time = time.time()
+    def _remove_placeholder(self):
+        if self.placeholder_label is not None:
+            self.lines_layout.removeWidget(self.placeholder_label)
+            self.placeholder_label.deleteLater()
+            self.placeholder_label = None
 
+    def _fade_out_line(self, line_entry: Dict):
+        """Triggers a smooth 300ms fade-out animation before deleting the widget."""
+        if line_entry["fading"]:
+            return
+
+        line_entry["fading"] = True
+        label = line_entry["label"]
+
+        effect = QGraphicsOpacityEffect(label)
+        label.setGraphicsEffect(effect)
+
+        anim = QPropertyAnimation(effect, b"opacity")
+        anim.setDuration(self.config.fade_duration_ms)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+
+        def cleanup():
+            if label is not None:
+                self.lines_layout.removeWidget(label)
+                label.deleteLater()
+            if line_entry in self.lines:
+                self.lines.remove(line_entry)
+
+        anim.finished.connect(cleanup)
+        line_entry["anim"] = anim  # Retain animation object reference
+        anim.start()
+
+    def _process_incoming_update(self, text: str, is_final: bool, utterance_id: int):
+        self.last_audio_activity_time = time.time()
+        self._remove_placeholder()
+
+        # 1. Check if this is a brand new utterance
         if utterance_id != self.current_utterance_id:
-            # A new utterance has started — open a fresh, uncommitted line.
-            self.lines.append({"text": text, "completed_at": None, "utterance_id": utterance_id})
+            label = self._create_line_label(text)
+            self.lines_layout.addWidget(label)
+
+            line_entry = {
+                "utterance_id": utterance_id,
+                "label": label,
+                "completed_at": None,
+                "expiry_duration": 0.0,
+                "fading": False,
+                "anim": None,
+            }
+            self.lines.append(line_entry)
             self.current_utterance_id = utterance_id
         else:
-            # Same utterance as before — update its text in place.
-            for line in reversed(self.lines):
-                if line.get("utterance_id") == utterance_id:
-                    line["text"] = text
+            # 2. Update existing active line in place
+            for entry in reversed(self.lines):
+                if entry["utterance_id"] == utterance_id and not entry["fading"]:
+                    entry["label"].setText(text)
                     break
 
+        # 3. Finalize utterance lifecycle on segment end
         if is_final:
-            for line in reversed(self.lines):
-                if line.get("utterance_id") == utterance_id:
-                    line["completed_at"] = time.time()
+            for entry in reversed(self.lines):
+                if entry["utterance_id"] == utterance_id and not entry["fading"]:
+                    entry["completed_at"] = time.time()
+                    word_count = len(text.split())
+                    # Compute dynamic reading window based on content length
+                    entry["expiry_duration"] = self.config.base_line_expiry + (word_count * self.config.seconds_per_word)
                     break
-            # Any further messages (there shouldn't be any) start a new line
-            # rather than silently overwriting this now-locked one.
             self.current_utterance_id = None
 
-        while len(self.lines) > self.config.max_visible_lines:
-            self.lines.pop(0)
+        # 4. Enforce visible lines capacity with smooth fade out
+        active_lines = [entry for entry in self.lines if not entry["fading"]]
+        while len(active_lines) > self.config.max_visible_lines:
+            oldest_entry = active_lines.pop(0)
+            self._fade_out_line(oldest_entry)
 
     def _purge_expired_lines(self):
         now = time.time()
-        
-        # Check if entire display should auto-hide due to long silence
+
+        # Silence autohide: fade out all lines after prolonged inactivity
         if now - self.last_audio_activity_time >= self.config.silence_autohide_seconds:
-            if self.lines:
-                self.lines.clear()
+            for entry in list(self.lines):
+                if not entry["fading"]:
+                    self._fade_out_line(entry)
             return
 
-        # Decay non-active lines (top/completed lines) after line_expiry_seconds
-        remaining_lines = []
-        for line in self.lines:
-            if line["completed_at"] is not None:
-                if now - line["completed_at"] < self.config.line_expiry_seconds:
-                    remaining_lines.append(line)
-            else:
-                remaining_lines.append(line)
-
-        self.lines = remaining_lines
+        # Check line decay timers for completed segments
+        for entry in list(self.lines):
+            if entry["completed_at"] is not None and not entry["fading"]:
+                elapsed = now - entry["completed_at"]
+                if elapsed >= entry["expiry_duration"]:
+                    self._fade_out_line(entry)
 
     def _engine_tick(self):
-        has_updates = False
-
-        # 1. Pull new ASR chunks from pipeline Queue B
+        # 1. Poll incoming ASR results
         while not self.pipeline.text_queue.empty():
             try:
                 text, _latency, is_final, utterance_id = self.pipeline.text_queue.get_nowait()
                 if text:
                     self._process_incoming_update(text, is_final, utterance_id)
-                    has_updates = True
             except queue.Empty:
                 break
 
-        # 2. Check line expirations / time decay
-        prev_count = len(self.lines)
+        # 2. Process lifecycle animations & line decay
         self._purge_expired_lines()
-        if len(self.lines) != prev_count:
-            has_updates = True
-
-        # 3. Update UI if state changed
-        if has_updates or not self.lines:
-            if self.lines:
-                display_text = "\n".join(line["text"] for line in self.lines)
-                self.subtitle_label.setText(display_text)
-            else:
-                self.subtitle_label.setText("")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -312,15 +338,14 @@ class SubtitleOverlayApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
 
-    # --- Easily tune your settings here ---
     config = OverlayConfig(
-        max_chars_per_line=48,
         max_visible_lines=3,
-        line_expiry_seconds=3.2,
+        base_line_expiry=1.8,
+        seconds_per_word=0.22,
         silence_autohide_seconds=5.0,
-        split_on_punctuation=True,
-        split_on_capitalization=True,
-        font_size=20
+        font_size=20,
+        line_spacing=6,
+        fade_duration_ms=300
     )
 
     pipeline = AudioPipeline(model_size="base")
