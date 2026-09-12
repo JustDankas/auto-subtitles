@@ -1,5 +1,4 @@
 """
-Phase 7 — Low-Latency Audio Pipeline.
 Segments speech on natural pauses (VAD silence gate) with pre-roll padding
 to avoid clipping word onsets, a sentence-length max-segment safety net
 (not a routine trigger), and cross-segment context via initial_prompt.
@@ -25,7 +24,7 @@ except ImportError:
 
 BEAM_SIZE = 5
 PARTIAL_BEAM_SIZE = 1            # greedy — fast interim guess, thrown away once final arrives
-PARTIAL_INTERVAL_SECONDS = 0.7   # how often to show an updated interim guess while still listening
+PARTIAL_INTERVAL_SECONDS = 0.25  # rapid streaming updates (~4Hz) for smooth text flow
 VAD_CHUNK_SAMPLES = 512          # Silero VAD's required chunk size at 16kHz (~32ms)
 MIN_SILENCE_DURATION_MS = 550    # natural pause length before we consider an utterance done
 SPEECH_PAD_MS = 200              # padding VADIterator applies around detected speech edges
@@ -33,6 +32,7 @@ PRE_ROLL_CHUNKS = 10             # ~320ms of rolling history kept so we can back
 MAX_SEGMENT_SECONDS = 7.0        # sentence-length safety net, not a routine cutter
 MIN_SEGMENT_SECONDS = 0.3        # discard VAD blips too short to be real speech
 PROMPT_RESET_GAP_SECONDS = 8.0   # if this much time passes with no speech, drop prompt context
+
 
 class AudioPipeline:
     def __init__(self, model_size="base", vad_threshold=0.5):
@@ -86,7 +86,6 @@ class AudioPipeline:
 
             start_time = time.time()
             if is_final:
-                # Accurate pass: full beam search, cross-segment context, extra VAD trim.
                 segments, _ = model.transcribe(
                     audio_segment,
                     beam_size=BEAM_SIZE,
@@ -97,9 +96,6 @@ class AudioPipeline:
                     vad_parameters=dict(min_silence_duration_ms=300),
                 )
             else:
-                # Interim pass: greedy decode of the growing buffer so far.
-                # This is a full re-decode, not incremental — expect the odd
-                # word to change between successive partials, that's normal.
                 segments, _ = model.transcribe(
                     audio_segment,
                     beam_size=PARTIAL_BEAM_SIZE,
@@ -134,9 +130,6 @@ class AudioPipeline:
         resample_transform = T.Resample(orig_freq=input_rate, new_freq=target_rate)
         buffer = np.array([], dtype=np.float32)
 
-        # Rolling pre-roll so we can backfill audio from just before VAD
-        # actually flips to "speech" — avoids clipping word onsets, since
-        # VAD needs a little accumulated evidence before it fires.
         history = deque(maxlen=PRE_ROLL_CHUNKS)
         utterance_chunks = []
         recording = False
@@ -178,8 +171,6 @@ class AudioPipeline:
                     recording = True
                     utterance_id += 1
                     last_partial_time = time.time()
-                    # Backfill pre-roll history — history already includes
-                    # the current chunk (appended above), in correct order.
                     utterance_chunks = list(history)
 
                 elif event and "end" in event and recording:
@@ -190,24 +181,13 @@ class AudioPipeline:
                 if recording:
                     duration = len(utterance_chunks) * VAD_CHUNK_SAMPLES / target_rate
 
-                    # Safety net: force-flush a runaway segment (e.g. uninterrupted
-                    # back-and-forth dialogue) at MAX_SEGMENT_SECONDS instead of
-                    # waiting indefinitely for a real pause.
                     if duration >= MAX_SEGMENT_SECONDS:
                         self._emit_segment(utterance_chunks, target_rate, utterance_id, is_final=True)
                         utterance_chunks = []
-                        # Reset the iterator's internal state since we're
-                        # cutting mid-speech rather than at a real silence.
                         vad_iterator.reset_states()
-                        # New id: the continuation is displayed as its own
-                        # line rather than silently overwriting the one we
-                        # just finalized.
                         utterance_id += 1
                         last_partial_time = time.time()
 
-                    # Interim update: only fire if the ASR worker has caught
-                    # up (queue empty) so partials never queue up behind
-                    # each other and delay the eventual final result.
                     elif (time.time() - last_partial_time) >= PARTIAL_INTERVAL_SECONDS \
                             and self.asr_queue.qsize() == 0:
                         self._emit_segment(utterance_chunks, target_rate, utterance_id, is_final=False)
@@ -219,7 +199,7 @@ class AudioPipeline:
         full_segment = np.concatenate(chunks).astype(np.float32)
         duration = len(full_segment) / sample_rate
         if is_final and duration < MIN_SEGMENT_SECONDS:
-            return  # too short to be real speech — likely a VAD blip
+            return
         self.asr_queue.put({
             "audio": full_segment,
             "is_final": is_final,
