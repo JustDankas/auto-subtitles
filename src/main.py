@@ -10,7 +10,7 @@ from PyQt6.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect, Qt,
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (QApplication, QFrame, QGraphicsOpacityEffect,
                              QHBoxLayout, QLabel, QMainWindow, QPushButton,
-                             QVBoxLayout, QWidget)
+                             QSizePolicy, QVBoxLayout, QWidget)
 
 from audio_pipeline import AudioPipeline
 
@@ -28,12 +28,15 @@ class OverlayConfig:
     seconds_per_word: float = 0.22        # Additional display time granted per word
     silence_autohide_seconds: float = 5.0 # Complete silence duration before clearing all lines
 
-    # --- Visual Style ---
+    # --- Visual Style & Layout Bounds ---
     font_size: int = 20                   # Subtitle font size in pixels
     bg_opacity: int = 180                 # Background opacity (0 = transparent, 255 = solid)
-    text_color: str = "#FFFFFF"           # Hex text color
+    text_color: str = "#FFFFFF"           # Hex text color for stable text
+    new_word_color: str = "#FFD700"       # Hex text color for newly added partial words (Gold)
     line_spacing: int = 6                 # Pixel gap between stacked line bubbles
     fade_duration_ms: int = 300           # Fade-out animation length in milliseconds
+    min_line_height: int = 38             # Minimum height per line box to stop layout vertical jumps
+    label_width: int = 800                # Fixed width for subtitle lines to prevent layout resize twitch
 
 
 def set_native_click_through(hwnd: int, enable: bool):
@@ -75,8 +78,9 @@ class SubtitleOverlayApp(QMainWindow):
         self.is_native_passthrough = False
 
         # Active lines tracking list:
-        # Each entry: {"utterance_id": int, "label": QLabel, "completed_at": Optional[float],
-        #              "expiry_duration": float, "fading": bool, "anim": Optional[QPropertyAnimation]}
+        # Each entry: {"utterance_id": int, "label": QLabel, "raw_text": str,
+        #              "completed_at": Optional[float], "expiry_duration": float,
+        #              "fading": bool, "anim": Optional[QPropertyAnimation]}
         self.lines: List[Dict] = []
         self.current_utterance_id: Optional[int] = None
         self.last_audio_activity_time = time.time()
@@ -95,8 +99,12 @@ class SubtitleOverlayApp(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def _init_ui(self):
-        self.resize(850, 220)
-        self.setMinimumSize(400, 120)
+        # Calculate maximum container height to reserve space and prevent vertical cropping
+        max_container_height = (self.config.min_line_height + self.config.line_spacing) * self.config.max_visible_lines + 80
+        window_width = self.config.label_width + 40
+
+        self.resize(window_width, max_container_height)
+        self.setMinimumSize(window_width, max_container_height)
 
         central_widget = QWidget(self)
         central_widget.setStyleSheet("background: transparent;")
@@ -145,7 +153,7 @@ class SubtitleOverlayApp(QMainWindow):
         self.lines_layout = QVBoxLayout(self.lines_container)
         self.lines_layout.setContentsMargins(5, 5, 5, 5)
         self.lines_layout.setSpacing(self.config.line_spacing)
-        self.lines_layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+        self.lines_layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
 
         main_layout.addWidget(self.lines_container, stretch=1)
 
@@ -154,10 +162,13 @@ class SubtitleOverlayApp(QMainWindow):
         self.lines_layout.addWidget(self.placeholder_label)
 
     def _create_line_label(self, initial_text: str = "") -> QLabel:
-        """Creates a standardized, left-aligned subtitle label bubble."""
-        label = QLabel(initial_text, self.lines_container)
+        """Creates a standardized, fixed-width left-aligned subtitle label bubble."""
+        label = QLabel(self.lines_container)
+        label.setTextFormat(Qt.TextFormat.RichText)
         label.setWordWrap(True)
         label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setFixedWidth(self.config.label_width)
+        label.setMinimumHeight(self.config.min_line_height)
         label.setStyleSheet(f"""
             QLabel {{
                 color: {self.config.text_color};
@@ -166,10 +177,39 @@ class SubtitleOverlayApp(QMainWindow):
                 background-color: rgba(0, 0, 0, {self.config.bg_opacity});
                 border-radius: 6px;
                 padding: 6px 12px;
-                line-height: 125%;
             }}
         """)
+        if initial_text:
+            label.setText(f'<span style="color: {self.config.text_color};">{initial_text}</span>')
         return label
+
+    def _format_diff_text(self, old_text: str, new_text: str) -> str:
+        """Compares old and new text word-by-word to highlight newly appended partial words."""
+        old_words = old_text.strip().split()
+        new_words = new_text.strip().split()
+
+        if not old_words:
+            return " ".join(
+                f'<span style="color: {self.config.new_word_color};">{w}</span>' for w in new_words
+            )
+
+        common_len = 0
+        min_len = min(len(old_words), len(new_words))
+        while common_len < min_len and old_words[common_len] == new_words[common_len]:
+            common_len += 1
+
+        stable_part = " ".join(new_words[:common_len])
+        new_part = " ".join(new_words[common_len:])
+
+        formatted_str = ""
+        if stable_part:
+            formatted_str += f'<span style="color: {self.config.text_color};">{stable_part}</span>'
+        if new_part:
+            if formatted_str:
+                formatted_str += " "
+            formatted_str += f'<span style="color: {self.config.new_word_color};">{new_part}</span>'
+
+        return formatted_str
 
     def _init_timers(self):
         # Poll hover state for OS click-through
@@ -244,12 +284,19 @@ class SubtitleOverlayApp(QMainWindow):
 
         # 1. Check if this is a brand new utterance
         if utterance_id != self.current_utterance_id:
-            label = self._create_line_label(text)
+            label = self._create_line_label()
+            formatted_html = (
+                f'<span style="color: {self.config.text_color};">{text}</span>'
+                if is_final
+                else self._format_diff_text("", text)
+            )
+            label.setText(formatted_html)
             self.lines_layout.addWidget(label)
 
             line_entry = {
                 "utterance_id": utterance_id,
                 "label": label,
+                "raw_text": text,
                 "completed_at": None,
                 "expiry_duration": 0.0,
                 "fading": False,
@@ -258,10 +305,17 @@ class SubtitleOverlayApp(QMainWindow):
             self.lines.append(line_entry)
             self.current_utterance_id = utterance_id
         else:
-            # 2. Update existing active line in place
+            # 2. Update existing active line in place with word diffing
             for entry in reversed(self.lines):
                 if entry["utterance_id"] == utterance_id and not entry["fading"]:
-                    entry["label"].setText(text)
+                    if is_final:
+                        entry["label"].setText(
+                            f'<span style="color: {self.config.text_color};">{text}</span>'
+                        )
+                    else:
+                        formatted_html = self._format_diff_text(entry["raw_text"], text)
+                        entry["label"].setText(formatted_html)
+                    entry["raw_text"] = text
                     break
 
         # 3. Finalize utterance lifecycle on segment end
@@ -270,8 +324,9 @@ class SubtitleOverlayApp(QMainWindow):
                 if entry["utterance_id"] == utterance_id and not entry["fading"]:
                     entry["completed_at"] = time.time()
                     word_count = len(text.split())
-                    # Compute dynamic reading window based on content length
-                    entry["expiry_duration"] = self.config.base_line_expiry + (word_count * self.config.seconds_per_word)
+                    entry["expiry_duration"] = self.config.base_line_expiry + (
+                        word_count * self.config.seconds_per_word
+                    )
                     break
             self.current_utterance_id = None
 
@@ -344,6 +399,9 @@ def main():
         seconds_per_word=0.22,
         silence_autohide_seconds=5.0,
         font_size=20,
+        new_word_color="#FFD700",
+        min_line_height=38,
+        label_width=800,
         line_spacing=6,
         fade_duration_ms=300
     )
