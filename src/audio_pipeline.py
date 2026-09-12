@@ -1,9 +1,3 @@
-"""
-Segments speech on natural pauses (VAD silence gate) with pre-roll padding
-to avoid clipping word onsets, a sentence-length max-segment safety net
-(not a routine trigger), and cross-segment context via initial_prompt.
-"""
-
 import queue
 import threading
 import time
@@ -22,16 +16,16 @@ except ImportError:
     exit(1)
 
 
-BEAM_SIZE = 5
-PARTIAL_BEAM_SIZE = 1            # greedy — fast interim guess, thrown away once final arrives
-PARTIAL_INTERVAL_SECONDS = 0.25  # rapid streaming updates (~4Hz) for smooth text flow
-VAD_CHUNK_SAMPLES = 512          # Silero VAD's required chunk size at 16kHz (~32ms)
-MIN_SILENCE_DURATION_MS = 550    # natural pause length before we consider an utterance done
-SPEECH_PAD_MS = 200              # padding VADIterator applies around detected speech edges
-PRE_ROLL_CHUNKS = 10             # ~320ms of rolling history kept so we can backfill speech onset
-MAX_SEGMENT_SECONDS = 7.0        # sentence-length safety net, not a routine cutter
-MIN_SEGMENT_SECONDS = 0.3        # discard VAD blips too short to be real speech
-PROMPT_RESET_GAP_SECONDS = 8.0   # if this much time passes with no speech, drop prompt context
+BEAM_SIZE = 2                    # Reduced from 5 to prevent thread blocking on final pass
+PARTIAL_BEAM_SIZE = 1            # Fast greedy pass for interim text
+PARTIAL_INTERVAL_SECONDS = 0.25  # Frequent partial polling (~4Hz)
+VAD_CHUNK_SAMPLES = 512          # Silero VAD chunk size at 16kHz (~32ms)
+MIN_SILENCE_DURATION_MS = 380    # Lowered from 550ms to catch micro-pauses quicker
+SPEECH_PAD_MS = 200              # Padding around detected speech edges
+PRE_ROLL_CHUNKS = 10             # ~320ms rolling onset buffer
+MAX_SEGMENT_SECONDS = 3.2        # Lowered from 7.0s to force frequent chunks on monologues
+MIN_SEGMENT_SECONDS = 0.3        # Ignores noise blips
+PROMPT_RESET_GAP_SECONDS = 6.0   # Context reset threshold after silence
 
 
 class AudioPipeline:
@@ -91,9 +85,9 @@ class AudioPipeline:
                     beam_size=BEAM_SIZE,
                     language="en",
                     condition_on_previous_text=False,
-                    initial_prompt=last_text[-200:] if last_text else None,
+                    initial_prompt=last_text[-150:] if last_text else None,
                     vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=300),
+                    vad_parameters=dict(min_silence_duration_ms=250),
                 )
             else:
                 segments, _ = model.transcribe(
@@ -188,8 +182,7 @@ class AudioPipeline:
                         utterance_id += 1
                         last_partial_time = time.time()
 
-                    elif (time.time() - last_partial_time) >= PARTIAL_INTERVAL_SECONDS \
-                            and self.asr_queue.qsize() == 0:
+                    elif (time.time() - last_partial_time) >= PARTIAL_INTERVAL_SECONDS:
                         self._emit_segment(utterance_chunks, target_rate, utterance_id, is_final=False)
                         last_partial_time = time.time()
 
@@ -200,6 +193,14 @@ class AudioPipeline:
         duration = len(full_segment) / sample_rate
         if is_final and duration < MIN_SEGMENT_SECONDS:
             return
+
+        # Purge stale pending partials while preserving the internal deque type
+        if not is_final:
+            with self.asr_queue.mutex:
+                self.asr_queue.queue = deque(
+                    item for item in self.asr_queue.queue if item["is_final"]
+                )
+
         self.asr_queue.put({
             "audio": full_segment,
             "is_final": is_final,
