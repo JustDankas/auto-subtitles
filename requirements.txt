@@ -1,0 +1,5 @@
+numpy
+sherpa-onnx
+PyAudioWPatch
+PyQt6
+audioop-lts; python_version >= "3.13"
