@@ -2,4 +2,5 @@ numpy
 sherpa-onnx
 PyAudioWPatch
 PyQt6
+text2num
 audioop-lts; python_version >= "3.13"

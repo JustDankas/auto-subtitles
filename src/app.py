@@ -37,6 +37,18 @@ def main() -> None:
     parser.add_argument("--min-silence", type=float, default=0.5)
     parser.add_argument("--rule2-silence", type=float, default=0.5)
     parser.add_argument("--rule3-utterance", type=float, default=12.0)
+    parser.add_argument(
+        "--numbers",
+        choices=["on", "off"],
+        default="on",
+        help="Convert spoken numbers to digits (default: on)",
+    )
+    parser.add_argument(
+        "--number-threshold",
+        type=float,
+        default=3.0,
+        help="Minimum number value to convert (default: 3)",
+    )
     parser.add_argument("--new-text-color", type=str, default="#FFFF00")
     parser.add_argument("--old-text-color", type=str, default="#E5E5E5")
     parser.add_argument("--width", type=int, default=900)
@@ -84,6 +96,8 @@ def main() -> None:
         min_silence=args.min_silence,
         rule2_min_trailing_silence=args.rule2_silence,
         rule3_min_utterance_length=args.rule3_utterance,
+        numbers=args.numbers == "on",
+        number_threshold=args.number_threshold,
     )
 
     worker.partial_updated.connect(overlay.update_partial)

@@ -74,6 +74,8 @@ class PipelineWorker(QThread):
         min_silence: float = 0.5,
         rule2_min_trailing_silence: float = 0.8,
         rule3_min_utterance_length: float = 8.0,
+        numbers: bool = True,
+        number_threshold: float = 3.0,
         parent=None,
     ):
         super().__init__(parent)
@@ -86,6 +88,8 @@ class PipelineWorker(QThread):
         self.min_silence = min_silence
         self.rule2_min_trailing_silence = rule2_min_trailing_silence
         self.rule3_min_utterance_length = rule3_min_utterance_length
+        self.numbers = numbers
+        self.number_threshold = number_threshold
 
         self._stop_requested = False
         self.capture: LoopbackAudioCapture | None = None
@@ -135,7 +139,11 @@ class PipelineWorker(QThread):
             def handle_update(update) -> None:
                 nonlocal last_partial_emit_time, last_emitted_partial
                 if update.finalized_text is not None:
-                    formatted = format_line(update.finalized_text)
+                    formatted = format_line(
+                        update.finalized_text,
+                        numbers=self.numbers,
+                        number_threshold=self.number_threshold,
+                    )
                     logger.log(
                         text=formatted,
                         confidence=update.confidence,
@@ -145,7 +153,11 @@ class PipelineWorker(QThread):
                     last_emitted_partial = ""
                     return
                 now = time.perf_counter()
-                formatted_partial = format_line(update.partial_text)
+                formatted_partial = format_line(
+                    update.partial_text,
+                    numbers=self.numbers,
+                    number_threshold=self.number_threshold,
+                )
                 if formatted_partial != last_emitted_partial and (
                     now - last_partial_emit_time >= PARTIAL_EMIT_MIN_INTERVAL_S
                 ):
