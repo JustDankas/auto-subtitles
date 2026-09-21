@@ -13,6 +13,9 @@ _TWO_ISOLATED_2DIGIT_NUMS = re.compile(
     r"(?<!\d)\b(\d{2})\s+(\d{2})\b(?!\s*\d)"
 )
 
+# Matches any digit followed by groups of 3 digits
+_THOUSANDS_SEPARATOR = re.compile(r"(\d)(?=(\d{3})+(?!\d))")
+
 
 def _combine_cued_years(text: str) -> str:
     return _YEAR_PAIR_AFTER_CUE.sub(
@@ -23,6 +26,8 @@ def _combine_cued_years(text: str) -> str:
 def _combine_isolated_2digit_pairs(text: str) -> str:
     return _TWO_ISOLATED_2DIGIT_NUMS.sub(r"\1\2", text)
 
+def _add_thousands_separators(text: str) -> str:
+    return _THOUSANDS_SEPARATOR.sub(r"\1,", text)
 
 def format_line(
     raw_text: str,
@@ -37,6 +42,7 @@ def format_line(
         text = alpha2digit(text, "en", threshold=number_threshold)
         # text = _combine_cued_years(text)
         text = _combine_isolated_2digit_pairs(text)
+        text = _add_thousands_separators(text)
     text = text[0].upper() + text[1:]
     text = _STANDALONE_I.sub("I", text)
     return text
