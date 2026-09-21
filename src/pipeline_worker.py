@@ -55,6 +55,18 @@ def find_model_files(model_dir: Path, want_int8: bool) -> dict:
         "tokens": str(tokens),
     }
 
+def _find_overlap(prev_words: list[str], new_words: list[str]) -> int:
+    """Returns the number of overlapping words at the boundary."""
+    max_match = min(len(prev_words), len(new_words))
+    prev_words = [w.lower() for w in prev_words]
+    new_words = [w.lower() for w in new_words]
+    for i in range(max_match, 0, -1):
+        if prev_words[-i:] == new_words[:i]:
+            return i
+    return 0
+
+
+
 
 class PipelineWorker(QThread):
     partial_updated = pyqtSignal(str)  # throttled, in-progress line
@@ -71,11 +83,12 @@ class PipelineWorker(QThread):
         int8: bool = False,
         vad_threshold: float = 0.5,
         min_silence: float = 0.5,
-        rule2_min_trailing_silence: float = 0.8,
-        rule3_min_utterance_length: float = 8.0,
+        rule2_min_trailing_silence: float = 1.2,
+        rule3_min_utterance_length: float = 12.0,
         numbers: bool = True,
         number_threshold: float = 3.0,
         num_threads: int = 3,
+        overlap_seconds: float = 1.0,
         parent=None,
     ):
         super().__init__(parent)
@@ -91,7 +104,8 @@ class PipelineWorker(QThread):
         self.numbers = numbers
         self.number_threshold = number_threshold
         self.num_threads = num_threads
-
+        self.overlap_seconds = overlap_seconds
+        
         self._stop_requested = False
         self.capture: LoopbackAudioCapture | None = None
 
@@ -117,6 +131,7 @@ class PipelineWorker(QThread):
                 provider=self.provider,
                 rule2_min_trailing_silence=self.rule2_min_trailing_silence,
                 rule3_min_utterance_length=self.rule3_min_utterance_length,
+                overlap_seconds=self.overlap_seconds,
             )
 
             ring_buffer = AudioRingBuffer(sample_rate=TARGET_RATE, max_seconds=10.0)
@@ -138,11 +153,20 @@ class PipelineWorker(QThread):
             last_partial_emit_time = 0.0
             last_emitted_partial = ""
 
+            # Keep up to 5 words from the previous finalized line to catch overlaps
+            overlap_memory: list[str] = []
+
+
+
             def handle_update(update) -> None:
-                nonlocal last_partial_emit_time, last_emitted_partial
+                nonlocal last_partial_emit_time, last_emitted_partial, overlap_memory
                 if update.finalized_text is not None:
+                    raw_words = update.finalized_text.split()
+                    overlap_count = _find_overlap(overlap_memory, raw_words)
+                    deduped_text = " ".join(raw_words[overlap_count:])
+                    
                     formatted = format_line(
-                        update.finalized_text,
+                        deduped_text,
                         numbers=self.numbers,
                         number_threshold=self.number_threshold,
                     )
@@ -153,10 +177,19 @@ class PipelineWorker(QThread):
                     )
                     self.line_finalized.emit(formatted)
                     last_emitted_partial = ""
+                    # Store the end of this finalized text to deduplicate the next stream
+                    overlap_memory = raw_words[-5:] if raw_words else []                    
                     return
+
+                
+                # Handle partial updates
+                raw_words = update.partial_text.split()
+                overlap_count = _find_overlap(overlap_memory, raw_words)
+                deduped_text = " ".join(raw_words[overlap_count:])
+
                 now = time.perf_counter()
                 formatted_partial = format_line(
-                    update.partial_text,
+                    deduped_text,
                     numbers=self.numbers,
                     number_threshold=self.number_threshold,
                 )
@@ -185,11 +218,13 @@ class PipelineWorker(QThread):
                     is_active = gate.is_speech_active()
                     if is_active:
                         if not was_speech_active:
+                            print(f"VAD: {is_active}, pre_roll: {len(pre_roll)}")
                             for chunk in pre_roll:
                                 handle_update(asr.feed(chunk))
                             pre_roll.clear()
                         handle_update(asr.feed(samples))
                     else:
+                        print(f"VAD: {is_active}, pre_roll: {len(pre_roll)}")
                         pre_roll.append(samples)
                     was_speech_active = is_active
 

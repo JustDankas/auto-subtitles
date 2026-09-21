@@ -45,6 +45,8 @@ class StreamingAsrEngine:
         rule1_min_trailing_silence: float = 2.4,
         rule2_min_trailing_silence: float = 1.2,
         rule3_min_utterance_length: float = 20.0,
+        overlap_seconds: float = 1.0,
+
     ):
         """
         rule1/rule2_min_trailing_silence: seconds of trailing silence before
@@ -74,6 +76,11 @@ class StreamingAsrEngine:
         )
         self._stream = self._recognizer.create_stream()
         self._samples_fed_since_reset = 0
+        # Audio overlap state
+        self._max_history_samples = int(overlap_seconds * sample_rate)
+        self._audio_history = np.zeros(0, dtype=np.float32)
+
+
 
     def feed(self, samples: np.ndarray) -> AsrUpdate:
         """Feed one chunk of speech audio (caller is responsible for VAD
@@ -81,6 +88,11 @@ class StreamingAsrEngine:
         text, plus finalized_text if the endpoint detector fired."""
         self._stream.accept_waveform(self.sample_rate, samples)
         self._samples_fed_since_reset += len(samples)
+
+        # Keep a rolling buffer of the most recent audio
+        self._audio_history = np.concatenate([self._audio_history, samples])[-self._max_history_samples:]
+
+
 
         while self._recognizer.is_ready(self._stream):
             self._recognizer.decode_stream(self._stream)
@@ -93,6 +105,16 @@ class StreamingAsrEngine:
             duration = self._samples_fed_since_reset / self.sample_rate
             self._recognizer.reset(self._stream)
             self._samples_fed_since_reset = 0
+
+                        
+            # Immediately inject the overlapping audio tail into the fresh stream
+            if len(self._audio_history) > 0:
+                self._stream.accept_waveform(self.sample_rate, self._audio_history)
+                self._samples_fed_since_reset += len(self._audio_history)
+                # Clear history so we don't replay it again if another cut happens immediately
+                self._audio_history = np.zeros(0, dtype=np.float32)
+
+
             return AsrUpdate(
                 partial_text="",
                 finalized_text=finalized_text,

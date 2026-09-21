@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--min-silence", type=float, default=1.2, help="Seconds of silence to consider a line ended (default: 0.5)")
     parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
     parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 20.0)")
+    parser.add_argument("--overlap-seconds", type=float, default=1.0, help="Seconds of audio overlap to feed into the next line when rule3 is triggered (default: 1.0)")
     parser.add_argument(
         "--numbers",
         choices=["on", "off"],
@@ -114,6 +115,7 @@ def main() -> None:
         numbers=args.numbers == "on",
         number_threshold=args.number_threshold,
         num_threads=args.num_threads,
+        overlap_seconds=args.overlap_seconds,
     )
 
     worker.partial_updated.connect(overlay.update_partial)
