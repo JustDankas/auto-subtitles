@@ -110,3 +110,8 @@ eval_pipeline/
 eval_runs/
 onnx_pretrained/
 PLANS/
+
+# ==========================================
+# Model Checkpoints
+# ==========================================
+models/
