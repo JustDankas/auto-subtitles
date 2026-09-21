@@ -34,9 +34,9 @@ def main() -> None:
     parser.add_argument("--num-threads", type=int, default=3)
     parser.add_argument("--log-file", type=str, default="transcript.jsonl")
     parser.add_argument("--vad-threshold", type=float, default=0.15)
-    parser.add_argument("--min-silence", type=float, default=0.5)
-    parser.add_argument("--rule2-silence", type=float, default=0.5)
-    parser.add_argument("--rule3-utterance", type=float, default=12.0)
+    parser.add_argument("--min-silence", type=float, default=1.2, help="Seconds of silence to consider a line ended (default: 0.5)")
+    parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
+    parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 20.0)")
     parser.add_argument(
         "--numbers",
         choices=["on", "off"],
@@ -59,14 +59,29 @@ def main() -> None:
         help="Make the caption box ignore mouse clicks (passes through to whatever's behind it). "
         "The drag handle above it always stays interactive regardless.",
     )
-    parser.add_argument("--x", type=int, default=100, help="Initial X position")
-    parser.add_argument("--y", type=int, default=100, help="Initial Y position")
+    parser.add_argument("--x", type=int, default=None, help="Initial X position")
+    parser.add_argument("--y", type=int, default=None, help="Initial Y position")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    handle = DragHandle()
+    # Calculate default positions if not specified
+    screen = app.primaryScreen().geometry()
+
+    if args.x is None:
+        # Middle of the X axis
+        start_x = (screen.width() - args.width) // 2
+    else:
+        start_x = args.x
+
+    if args.y is None:
+        # 1/3 from the bottom of the screen (2/3 down from the top)
+        start_y = int(screen.height() * (2 / 3)) - (args.height // 2)
+    else:
+        start_y = args.y
+
+    handle = DragHandle(width=args.width)
     overlay = SubtitleOverlay(
         new_text_color=args.new_text_color,
         old_text_color=args.old_text_color,
@@ -75,10 +90,10 @@ def main() -> None:
         click_through=args.click_through,
     )
 
-    overlay.move(args.x, args.y)
+    overlay.move(start_x, start_y)
     handle.move(
-        args.x + (args.width - handle.width()) // 2,
-        args.y - handle.height() // 2 + HANDLE_OVERLAP,
+        start_x,
+        start_y - handle.height() // 2 + HANDLE_OVERLAP,
     )
 
     def on_handle_moved(dx: int, dy: int) -> None:

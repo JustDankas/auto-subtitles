@@ -43,8 +43,8 @@ class StreamingAsrEngine:
         provider: str = "cpu",
         num_threads: int = 3,
         rule1_min_trailing_silence: float = 2.4,
-        rule2_min_trailing_silence: float = 0.8,
-        rule3_min_utterance_length: float = 8.0,
+        rule2_min_trailing_silence: float = 1.2,
+        rule3_min_utterance_length: float = 20.0,
     ):
         """
         rule1/rule2_min_trailing_silence: seconds of trailing silence before

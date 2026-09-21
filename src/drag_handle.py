@@ -34,7 +34,7 @@ class DragHandle(QWidget):
         self.setFixedSize(width, height)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 3, 6, 3)
+        layout.setContentsMargins(10, 3, 10, 3)
 
         grip = QLabel("\u2237\u2237 Drag to Move")  # simple grip glyph
         grip.setStyleSheet("color: white; font-size: 13px; font-weight: bold;")
