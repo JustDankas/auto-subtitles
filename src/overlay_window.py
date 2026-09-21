@@ -20,15 +20,14 @@ import logging
 import time
 from typing import List, Optional
 
+from line_splitter import split_into_chunks
 from PyQt6.QtCore import QPropertyAnimation, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PyQt6.QtWidgets import (QGraphicsOpacityEffect, QLabel, QVBoxLayout,
                              QWidget)
 
-from line_splitter import split_into_chunks
-
-MAX_LINES = 1
-MAX_RENDERED_LINES = 1
+MAX_LINES = 2
+MAX_RENDERED_LINES = 2
 BASE_DURATION_S = 2
 SECONDS_PER_WORD = 0.2
 MIN_DURATION_S = 2.0
@@ -138,6 +137,8 @@ class SubtitleOverlay(QWidget):
         click_through: bool = False,
     ):
         super().__init__()
+        self._handle_ref: Optional[QWidget] = None
+
         self._new_text_color = QColor(new_text_color)
         self._old_text_color = QColor(old_text_color)
         self._box_width = width - 2 * PANEL_MARGIN
@@ -169,6 +170,16 @@ class SubtitleOverlay(QWidget):
         self._consumed_prefix = ""
 
         self.set_click_through(click_through)
+
+    def set_drag_handle(self, handle: QWidget) -> None:
+            """Keep a reference to the handle so we can keep it on top."""
+            self._handle_ref = handle
+
+    def mousePressEvent(self, event) -> None:
+            """When the overlay is clicked, keep the handle on top."""
+            super().mousePressEvent(event)
+            if self._handle_ref:
+                self._handle_ref.raise_()
 
     def set_click_through(self, enabled: bool) -> None:
         """Toggle OS-level input transparency. See module docstring for the

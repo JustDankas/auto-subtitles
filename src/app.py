@@ -96,6 +96,7 @@ def main() -> None:
         start_x,
         start_y - handle.height() // 2 + HANDLE_OVERLAP,
     )
+    overlay.set_drag_handle(handle)
 
     def on_handle_moved(dx: int, dy: int) -> None:
         overlay.move(overlay.x() + dx, overlay.y() + dy)
