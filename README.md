@@ -16,7 +16,7 @@ All recognition happens on your machine. No audio leaves it.
 ## Features
 
 - Captures system audio through WASAPI loopback, so it works with any player or app, with no plugins.
-- Streaming recognition with a Zipformer transducer from [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Text appears while people are still speaking.
+- Streaming recognition with a Nemotron transducer from [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Text appears while people are still speaking.
 - Silero voice activity detection keeps silence and most music away from the recognizer.
 - Translucent, draggable, always-on-top caption window. Each line fades out after a few seconds.
 - Optional click-through mode (experimental) so clicks reach the app behind the captions.
@@ -73,24 +73,25 @@ Then continue with step 3. Activate the environment with `conda activate stream-
 
 **3. Download the models**
 
-The app needs a streaming speech recognition model (about 500 MB) and the Silero VAD model (under 1 MB). Both come from the sherpa-onnx release page.
+The app needs a streaming Nemotron speech recognition model, the Silero VAD model (under 1 MB), and the WeSpeaker CAM++ speaker recognition model. All models come from the sherpa-onnx release page.
 
 ```powershell
 mkdir models
 curl.exe -L -o models\silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-curl.exe -L -o models\zipformer-en.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-21.tar.bz2
-tar -xjf models\zipformer-en.tar.bz2 -C models
-Remove-Item models\zipformer-en.tar.bz2
+curl.exe -L -o models\wespeaker_en_voxceleb_CAM++.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx
+curl.exe -L -o models\nemotron.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2
+tar -xjf models\nemotron.tar.bz2 -C models
+Remove-Item models\nemotron.tar.bz2
 ```
 
-After extraction, `models\sherpa-onnx-streaming-zipformer-en-2023-06-21` contains `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, and `tokens.txt`.
+After extraction, the extracted `models\nemotron-en-0.6b-560ms-int8-2026-04-25` directory contains `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, and `tokens.txt`. The speaker model is saved as `models\wespeaker_en_voxceleb_CAM++.onnx`.
 
 ## Run
 
 Using recommended default hyperparameters
 
 ```powershell
-python src/app.py --asr-model-dir models\sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model models\silero_vad.onnx
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx
 ```
 
 Start any audio on your default output device (a YouTube video works well). Captions appear in the overlay within a few seconds. Drag the bar labeled **Drag to Move** to reposition the captions, and click the **✕** on that bar to quit.
@@ -99,13 +100,13 @@ More examples:
 
 ```powershell
 # Lower CPU use with the int8 model files
-python src/app.py --asr-model-dir models\sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model models\silero_vad.onnx --int8
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --int8
 
 # Raise the VAD threshold to reject background music, and write to a custom log file
-python src/app.py --asr-model-dir models\sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model models\silero_vad.onnx --vad-threshold 0.5 --log-file lecture.jsonl
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --vad-threshold 0.5 --log-file lecture.jsonl
 
 # Click-through captions, placed near the bottom of a 1080p screen
-python src/app.py --asr-model-dir models\sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model models\silero_vad.onnx --click-through --x 510 --y 860
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --click-through --x 510 --y 860
 ```
 
 ### Command-line options
@@ -158,7 +159,7 @@ SpeechGate              Silero VAD (sherpa-onnx, CPU), 512-sample windows
         |
         |-- no speech --> 0.3 s pre-roll buffer
         |
-        |-- speech -----> StreamingAsrEngine    Zipformer transducer, greedy search, endpoint detection
+        |-- speech -----> StreamingAsrEngine    Nemotron transducer, greedy search, endpoint detection
                                 |
                                 |-- partial text, throttled to 4 updates/s --> overlay (current line)
                                 |-- finalized line --> text_formatter --> overlay + TranscriptLogger (JSONL)
@@ -194,8 +195,6 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 **The ring buffer drops old audio instead of blocking.** Blocking inside the audio callback causes glitches. When a consumer falls more than 10 seconds behind, the buffer overwrites the oldest samples and counts them in `stats`.
 
 **The overlay uses two windows.** On Windows, click-through applies to a whole native window, so one window cannot be half click-through. The caption box can be click-through while the small drag handle stays interactive, which lets you move or close the app at any time.
-
-**Text formatting is a heuristic.** The Zipformer model outputs unpunctuated, all-caps text. `text_formatter.py` lowercases it, capitalizes the first letter of each line, and capitalizes the pronoun "I". It does not restore punctuation or proper nouns.
 
 ## Tuning
 
@@ -233,7 +232,7 @@ The CUDA path is untested. I could not get it working on a GTX 1070, and CPU inf
 ## Limitations
 
 - Windows only.
-- English only. The bundled model is an English streaming Zipformer.
+- English only. The bundled model is an English streaming Nemotron.
 - No punctuation, and proper nouns come out in lowercase.
 - Status and error messages print to the console and do not appear in the overlay.
 - Changing the default audio device while the app runs requires a restart.
@@ -251,6 +250,5 @@ The CUDA path is untested. I could not get it working on a GTX 1070, and CPU inf
 
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) for streaming ASR and VAD inference
 - [Silero VAD](https://github.com/snakers4/silero-vad) for voice activity detection
-- [icefall](https://github.com/k2-fsa/icefall) Zipformer models, trained by the k2-fsa team
 - [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI loopback capture
 - [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) for the overlay
