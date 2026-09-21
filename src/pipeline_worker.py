@@ -21,10 +21,9 @@ import collections
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, pyqtSignal
-
 from asr_engine import StreamingAsrEngine
 from audio_capture import TARGET_RATE, LoopbackAudioCapture
+from PyQt6.QtCore import QThread, pyqtSignal
 from ring_buffer import AudioRingBuffer
 from text_formatter import format_line
 from transcript_logger import TranscriptLogger
@@ -76,6 +75,7 @@ class PipelineWorker(QThread):
         rule3_min_utterance_length: float = 8.0,
         numbers: bool = True,
         number_threshold: float = 3.0,
+        num_threads: int = 3,
         parent=None,
     ):
         super().__init__(parent)
@@ -90,6 +90,7 @@ class PipelineWorker(QThread):
         self.rule3_min_utterance_length = rule3_min_utterance_length
         self.numbers = numbers
         self.number_threshold = number_threshold
+        self.num_threads = num_threads
 
         self._stop_requested = False
         self.capture: LoopbackAudioCapture | None = None
@@ -111,6 +112,7 @@ class PipelineWorker(QThread):
                 decoder=model_files["decoder"],
                 joiner=model_files["joiner"],
                 tokens=model_files["tokens"],
+                num_threads=self.num_threads,
                 sample_rate=TARGET_RATE,
                 provider=self.provider,
                 rule2_min_trailing_silence=self.rule2_min_trailing_silence,

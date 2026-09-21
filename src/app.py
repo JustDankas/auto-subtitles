@@ -17,11 +17,10 @@ Usage:
 import argparse
 import sys
 
-from PyQt6.QtWidgets import QApplication
-
 from drag_handle import DragHandle
 from overlay_window import SubtitleOverlay
 from pipeline_worker import PipelineWorker
+from PyQt6.QtWidgets import QApplication
 
 HANDLE_OVERLAP = 12
 
@@ -32,6 +31,7 @@ def main() -> None:
     parser.add_argument("--asr-model-dir", type=str, required=True)
     parser.add_argument("--int8", action="store_true")
     parser.add_argument("--provider", type=str, default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--num-threads", type=int, default=3)
     parser.add_argument("--log-file", type=str, default="transcript.jsonl")
     parser.add_argument("--vad-threshold", type=float, default=0.15)
     parser.add_argument("--min-silence", type=float, default=0.5)
@@ -98,6 +98,7 @@ def main() -> None:
         rule3_min_utterance_length=args.rule3_utterance,
         numbers=args.numbers == "on",
         number_threshold=args.number_threshold,
+        num_threads=args.num_threads,
     )
 
     worker.partial_updated.connect(overlay.update_partial)
