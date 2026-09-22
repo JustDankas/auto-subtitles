@@ -142,7 +142,8 @@ class SubtitleOverlay(QWidget):
         self._new_text_color = QColor(new_text_color)
         self._old_text_color = QColor(old_text_color)
         self._box_width = width - 2 * PANEL_MARGIN
-        self._font = QFont("Segoe UI", 18)
+        # self._font = QFont("Segoe UI", 18)
+        self._font = QFont("Inter", 18)
         self._split_width = max(1, self._box_width - 2 * BOX_MARGIN - SPLITTER_SAFETY_PX)
 
         self.setWindowFlags(
