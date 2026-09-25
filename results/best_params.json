@@ -1,0 +1,11 @@
+{
+  "speaker_k": 2.5,
+  "std_floor": 0.12500000000000003,
+  "speaker_min_window": 2,
+  "speaker_max_window": 15,
+  "min_active_seconds": 1.0,
+  "val_mean_fbeta": 0.3400986851386812,
+  "val_mean_precision": 0.375,
+  "val_mean_recall": 0.33214285714285713,
+  "train_mean_fbeta": 0.34924686493742985
+}
