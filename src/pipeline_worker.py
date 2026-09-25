@@ -89,7 +89,7 @@ class PipelineWorker(QThread):
         std_floor: float = 0.05,
         max_window: int = 20,
         speaker_split_backdate_seconds: float = 0.7,
-        speaker_split_mode: str = "token",  # "wallclock" or "token"
+        speaker_split_mode: str = "wallclock",  # "wallclock" or "token"
         # Speaker detection parameters
         provider: str = "cpu",
         int8: bool = False,

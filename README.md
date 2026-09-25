@@ -80,8 +80,16 @@ The app needs a streaming Nemotron speech recognition model, the Silero VAD mode
 mkdir models
 curl.exe -L -o models\silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
 curl.exe -L -o models\wespeaker_en_voxceleb_CAM++.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx
+# 1. Download the archive
 curl.exe -L -o models\nemotron.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2
-tar -xjf models\nemotron.tar.bz2 -C models
+
+# 2. Create your custom target directory inside models
+New-Item -ItemType Directory -Force -Path models\nemotron-en-0.6b-560ms-int8-2026-04-25
+
+# 3. Extract contents directly into your custom folder
+tar -xjf models\nemotron.tar.bz2 -C models\nemotron-en-0.6b-560ms-int8-2026-04-25 --strip-components=1
+
+# 4. Remove the archive
 Remove-Item models\nemotron.tar.bz2
 ```
 
@@ -92,7 +100,7 @@ After extraction, the extracted `models\nemotron-en-0.6b-560ms-int8-2026-04-25` 
 Using recommended default hyperparameters
 
 ```powershell
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25
+python src/app.py
 ```
 
 Start any audio on your default output device (a YouTube video works well). Captions appear in the overlay within a few seconds. Drag the bar labeled **Drag to Move** to reposition the captions, and click the **✕** on that bar to quit.
@@ -101,13 +109,13 @@ More examples:
 
 ```powershell
 # Speaker-change detection with suggested hyperparameters
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --int8 --speaker-model models\wespeaker_en_voxceleb_CAM++.onnx --speaker-k 1.5 --std-floor 0.125 --speaker-min-window 2 --speaker-max-window 15 --num-threads 4 --speaker-split-backdate-seconds 0.7 --speaker-split-mode token
+python src/app.py --int8 --speaker-model models\wespeaker_en_voxceleb_CAM++.onnx --speaker-k 1.5 --std-floor 0.125 --speaker-min-window 2 --speaker-max-window 15 --num-threads 4 --speaker-split-backdate-seconds 0.7 --speaker-split-mode token
 
 # Raise the VAD threshold to reject background music, and write to a custom log file
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --vad-threshold 0.5 --log-file lecture.jsonl
+python src/app.py --vad-threshold 0.5 --log-file lecture.jsonl
 
 # With click-through and custom new-utterance text color
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --click-through --new-text-color 00C3FF
+python src/app.py --click-through --new-text-color 00C3FF
 ```
 
 ### Command-line options

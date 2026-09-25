@@ -30,7 +30,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     # ASR options
     parser.add_argument("--vad-model", type=str, default="models\\silero_vad.onnx")
-    parser.add_argument("--asr-model-dir", type=str, required=True)
+    parser.add_argument("--asr-model-dir", type=str, default="models\\nemotron-en-0.6b-560ms-int8-2026-04-25")
     parser.add_argument("--int8", action="store_true")
     parser.add_argument("--provider", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--num-threads", type=int, default=3)
@@ -47,7 +47,7 @@ def main() -> None:
     parser.add_argument("--speaker-min-window", type=int, default=3, help="Min window before detection begins")
     parser.add_argument("--speaker-max-window", type=int, default=20, help="Max history window size")
     parser.add_argument("--speaker-split-backdate-seconds", type=float, default=0.7, help="Backdate for speaker change detection (default: 0.4)")
-    parser.add_argument("--speaker-split-mode", type=str, default="token", choices=["wallclock", "token"], help="Speaker change detection mode (default: wallclock)")
+    parser.add_argument("--speaker-split-mode", type=str, default="wallclock", choices=["wallclock", "token"], help="Speaker change detection mode (default: wallclock)")
     # Number formatting options
     parser.add_argument(
         "--numbers",
