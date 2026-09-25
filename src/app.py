@@ -29,12 +29,12 @@ HANDLE_OVERLAP = 12
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     # ASR options
-    parser.add_argument("--vad-model", type=str, default="silero_vad.onnx")
+    parser.add_argument("--vad-model", type=str, default="models\\silero_vad.onnx")
     parser.add_argument("--asr-model-dir", type=str, required=True)
     parser.add_argument("--int8", action="store_true")
     parser.add_argument("--provider", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--num-threads", type=int, default=3)
-    parser.add_argument("--log-file", type=str, default="transcript.jsonl")
+    parser.add_argument("--log-file", type=str, default="logs\\transcript.jsonl")
     parser.add_argument("--vad-threshold", type=float, default=0.2)
     parser.add_argument("--min-silence", type=float, default=1.2, help="Seconds of silence to consider a line ended (default: 0.5)")
     parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
@@ -62,8 +62,8 @@ def main() -> None:
         help="Minimum number value to convert (default: 3)",
     )
     # GUI options
-    parser.add_argument("--new-text-color", type=str, default="#FFFF00")
-    parser.add_argument("--old-text-color", type=str, default="#E5E5E5")
+    parser.add_argument("--new-text-color", type=str, default="FFFF00")
+    parser.add_argument("--old-text-color", type=str, default="E5E5E5")
     parser.add_argument("--width", type=int, default=900)
     parser.add_argument("--height", type=int, default=160)
     parser.add_argument(
@@ -96,8 +96,8 @@ def main() -> None:
 
     handle = DragHandle(width=args.width)
     overlay = SubtitleOverlay(
-        new_text_color=args.new_text_color,
-        old_text_color=args.old_text_color,
+        new_text_color=f"#{args.new_text_color}",
+        old_text_color=f"#{args.old_text_color}",
         width=args.width,
         height=args.height,
         click_through=args.click_through,
