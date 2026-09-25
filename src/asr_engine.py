@@ -81,7 +81,6 @@ class StreamingAsrEngine:
         self._audio_history = np.zeros(0, dtype=np.float32)
 
 
-
     def feed(self, samples: np.ndarray) -> AsrUpdate:
         """Feed one chunk of speech audio (caller is responsible for VAD
         gating - don't feed music/silence). Returns the current partial
@@ -123,6 +122,48 @@ class StreamingAsrEngine:
             )
 
         return AsrUpdate(partial_text=text)
+
+    def current_snapshot(self) -> AsrUpdate:
+            """Best-effort look at the in-progress line WITHOUT finalizing or
+            resetting the stream -- doesn't touch decode state at all beyond
+            what feed() already did. Used to support UI-only line breaks (e.g.
+            a detected speaker change) that must not disturb the continuous
+            backend decode: see PipelineWorker.emit_ui_split().
+    
+            duration_seconds here is the total audio fed since the last REAL
+            reset (same accounting as a normal finalize), not scoped to any
+            UI-only split -- callers wanting a duration for just the audio
+            since their last UI split should track the delta between
+            successive calls themselves (PipelineWorker does this).
+            """
+            text = self._recognizer.get_result(self._stream).strip()
+            confidence = self._estimate_confidence(self._stream) if text else None
+            duration = self._samples_fed_since_reset / self.sample_rate if text else None
+            return AsrUpdate(partial_text=text, confidence=confidence, duration_seconds=duration)
+
+    def force_finalize(self) -> Optional[AsrUpdate]:
+        """Force finalize current speech segment immediately on speaker change."""
+        text = self._recognizer.get_result(self._stream).strip()
+        if not text:
+            self._recognizer.reset(self._stream)
+            self._samples_fed_since_reset = 0
+            self._audio_history = np.zeros(0, dtype=np.float32)
+            return None
+
+        confidence = self._estimate_confidence(self._stream)
+        duration = self._samples_fed_since_reset / self.sample_rate
+
+        self._recognizer.reset(self._stream)
+        self._samples_fed_since_reset = 0
+        # Discard history so previous speaker's tail doesn't overlap into new speaker
+        self._audio_history = np.zeros(0, dtype=np.float32)
+
+        return AsrUpdate(
+            partial_text="",
+            finalized_text=text,
+            confidence=confidence,
+            duration_seconds=duration,
+        )
 
     def flush(self) -> Optional[AsrUpdate]:
         """Call at shutdown to force out any in-progress line."""

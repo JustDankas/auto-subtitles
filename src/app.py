@@ -17,27 +17,37 @@ Usage:
 import argparse
 import sys
 
+from PyQt6.QtWidgets import QApplication
+
 from drag_handle import DragHandle
 from overlay_window import SubtitleOverlay
 from pipeline_worker import PipelineWorker
-from PyQt6.QtWidgets import QApplication
 
 HANDLE_OVERLAP = 12
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    # ASR options
     parser.add_argument("--vad-model", type=str, default="silero_vad.onnx")
     parser.add_argument("--asr-model-dir", type=str, required=True)
     parser.add_argument("--int8", action="store_true")
     parser.add_argument("--provider", type=str, default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--num-threads", type=int, default=3)
     parser.add_argument("--log-file", type=str, default="transcript.jsonl")
-    parser.add_argument("--vad-threshold", type=float, default=0.15)
+    parser.add_argument("--vad-threshold", type=float, default=0.2)
     parser.add_argument("--min-silence", type=float, default=1.2, help="Seconds of silence to consider a line ended (default: 0.5)")
     parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
     parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 20.0)")
     parser.add_argument("--overlap-seconds", type=float, default=1.0, help="Seconds of audio overlap to feed into the next line when rule3 is triggered (default: 1.0)")
+    # Speaker detection options
+    parser.add_argument("--speaker-model", type=str, default=None, help="Path to wespeaker/CAM++ ONNX model. Leave this blank to disable speaker detection.")
+    parser.add_argument("--speaker-k", type=float, default=2.5, help="Z-score change detection threshold")
+    parser.add_argument("--std-floor", type=float, default=0.05, help="Minimum standard deviation floor")
+    parser.add_argument("--speaker-min-window", type=int, default=3, help="Min window before detection begins")
+    parser.add_argument("--speaker-max-window", type=int, default=20, help="Max history window size")
+    parser.add_argument("--speaker-split-backdate-seconds", type=float, default=0.7, help="Backdate for speaker change detection (default: 0.4)")
+    # Number formatting options
     parser.add_argument(
         "--numbers",
         choices=["on", "off"],
@@ -50,6 +60,7 @@ def main() -> None:
         default=3.0,
         help="Minimum number value to convert (default: 3)",
     )
+    # GUI options
     parser.add_argument("--new-text-color", type=str, default="#FFFF00")
     parser.add_argument("--old-text-color", type=str, default="#E5E5E5")
     parser.add_argument("--width", type=int, default=900)
@@ -107,6 +118,11 @@ def main() -> None:
         vad_model_path=args.vad_model,
         asr_model_dir=args.asr_model_dir,
         log_file=args.log_file,
+        speaker_model_path=args.speaker_model,
+        speaker_k=args.speaker_k,
+        speaker_min_window=args.speaker_min_window,
+        std_floor=args.std_floor,
+        max_window=args.speaker_max_window,
         provider=args.provider,
         int8=args.int8,
         vad_threshold=args.vad_threshold,

@@ -21,10 +21,13 @@ import collections
 import time
 from pathlib import Path
 
+import numpy as np
+from PyQt6.QtCore import QThread, pyqtSignal
+
 from asr_engine import StreamingAsrEngine
 from audio_capture import TARGET_RATE, LoopbackAudioCapture
-from PyQt6.QtCore import QThread, pyqtSignal
 from ring_buffer import AudioRingBuffer
+from speaker_detector import InstantChangeDetector, SpeakerEmbeddingService
 from text_formatter import format_line
 from transcript_logger import TranscriptLogger
 from vad_gate import SpeechGate
@@ -79,6 +82,14 @@ class PipelineWorker(QThread):
         vad_model_path: str,
         asr_model_dir: str,
         log_file: str,
+        # Speaker detection parameters
+        speaker_model_path: str | None = None,
+        speaker_k: float = 2.5,
+        speaker_min_window: int = 3,
+        std_floor: float = 0.05,
+        max_window: int = 20,
+        speaker_split_backdate_seconds: float = 0.7,
+        # Speaker detection parameters
         provider: str = "cpu",
         int8: bool = False,
         vad_threshold: float = 0.5,
@@ -105,6 +116,15 @@ class PipelineWorker(QThread):
         self.number_threshold = number_threshold
         self.num_threads = num_threads
         self.overlap_seconds = overlap_seconds
+        # Speaker detection parameters
+        self.speaker_model_path = speaker_model_path
+        self.speaker_k = speaker_k
+        self.speaker_min_window = speaker_min_window
+        self.std_floor = std_floor
+        self.max_window = max_window
+        self.speaker_split_backdate_seconds = speaker_split_backdate_seconds
+        # Speaker detection parameters
+
         
         self._stop_requested = False
         self.capture: LoopbackAudioCapture | None = None
@@ -144,6 +164,23 @@ class PipelineWorker(QThread):
             )
             logger = TranscriptLogger(self.log_file)
 
+            
+            speaker_service = None
+            detector = None
+            if self.speaker_model_path:
+                speaker_service = SpeakerEmbeddingService(
+                    model_path=self.speaker_model_path,
+                    provider=self.provider,
+                    num_threads=1,
+                    sample_rate=TARGET_RATE,
+                )
+                detector = InstantChangeDetector(
+                    k=self.speaker_k,
+                    min_window=self.speaker_min_window,
+                    std_floor=self.std_floor,
+                    max_window=self.max_window,
+                )
+
             self.capture.start()
             self.status_changed.emit(f"Listening: {self.capture.device_info['name']}")
 
@@ -154,42 +191,132 @@ class PipelineWorker(QThread):
             last_emitted_partial = ""
 
             # Keep up to 5 words from the previous finalized line to catch overlaps
+            # (words re-decoded from the audio_history replay after a REAL
+            # backend reset -- unrelated to speaker-change splitting below).
             overlap_memory: list[str] = []
+
+            # --- UI-only speaker-change line splitting state ---
+            # These never touch the ASR backend. pending_ui_offset counts
+            # how many words of the CURRENT (still-open) backend utterance
+            # have already been emitted as a previous UI line via
+            # emit_ui_split(); it resets to 0 only when the backend truly
+            # finalizes/resets (in handle_update's finalized branch below).
+            # last_known_words mirrors the most recent decoded+deduped word
+            # list for the current utterance, so emit_ui_split() has
+            # something to slice even though it runs from process_chunk,
+            # not handle_update. total_duration_at_last_split lets both a
+            # UI split and the eventual real finalize log a duration scoped
+            # to just their own words, instead of the whole utterance's
+            # cumulative duration.
+            #
+            # word_count_history records (wall_clock_time, word_count) every
+            # time last_known_words grows. emit_ui_split() uses this to find
+            # the word count as it stood --speaker-split-backdate seconds in
+            # the past, instead of splitting at the current instant. Two
+            # problems this solves at once: (1) text decoded in the last
+            # ~second is often still settling -- a transducer needs a little
+            # trailing audio context to firm up its last word or two, and
+            # splitting on it live was producing truncated/garbled fragments
+            # (e.g. a lone low-confidence "Ask" or a hallucinated "As the
+            # thing" that doesn't even appear in a clean decode of the same
+            # audio); (2) the detector itself needs some accumulation window
+            # to confirm a change, so by the time it fires, a bit of the
+            # INCOMING speaker's audio has usually already been decoded as
+            # part of the still-open (outgoing) line -- backdating the split
+            # leaves those trailing words pending instead of gluing them onto
+            # the wrong line, so they show up at the start of the next line
+            # instead.
+            pending_ui_offset = 0
+            last_known_words: list[str] = []
+            total_duration_at_last_split = 0.0
+            word_count_history: collections.deque = collections.deque()
+
+            def process_chunk(chunk: np.ndarray) -> None:
+                # 1. Feed audio array to ASR engine
+                update = asr.feed(chunk)
+                handle_update(update)
+
+                # 2. Feed the SAME audio array to speaker detector
+                if speaker_service and detector:
+                    emb = speaker_service.extract(chunk)
+                    if emb is not None:
+                        is_change, z_score = detector.process(emb)
+                        if is_change:
+                            print(f"[SPEAKER CHANGE] Triggered with Z-score: {z_score} (Threshold k={self.speaker_k})")
+                            emit_ui_split()
+                            speaker_service.reset()
 
 
 
             def handle_update(update) -> None:
                 nonlocal last_partial_emit_time, last_emitted_partial, overlap_memory
+                nonlocal pending_ui_offset, last_known_words, total_duration_at_last_split
+                nonlocal word_count_history
+
                 if update.finalized_text is not None:
                     raw_words = update.finalized_text.split()
                     overlap_count = _find_overlap(overlap_memory, raw_words)
-                    deduped_text = " ".join(raw_words[overlap_count:])
-                    
-                    formatted = format_line(
-                        deduped_text,
-                        numbers=self.numbers,
-                        number_threshold=self.number_threshold,
-                    )
-                    logger.log(
-                        text=formatted,
-                        confidence=update.confidence,
-                        duration=update.duration_seconds or 0.0,
-                    )
-                    self.line_finalized.emit(formatted)
+                    deduped_words = raw_words[overlap_count:]
+
+                    # Words already shown via an earlier UI-only speaker-change
+                    # split within THIS SAME backend utterance (emit_ui_split)
+                    # are already on screen -- only emit what's new since then.
+                    new_words = deduped_words[pending_ui_offset:]
+
+                    total_now = update.duration_seconds or 0.0
+                    segment_duration = max(total_now - total_duration_at_last_split, 0.0)
+
+                    # The backend utterance is truly finalizing/resetting now,
+                    # so all UI-split bookkeeping for it resets too. Word
+                    # count history from this utterance is meaningless once
+                    # word indices restart at 0 for the next one.
+                    overlap_memory = raw_words[-5:] if raw_words else []
+                    pending_ui_offset = 0
+                    last_known_words = []
+                    total_duration_at_last_split = 0.0
+                    word_count_history = collections.deque()
+
+                    if new_words:
+                        formatted = format_line(
+                            " ".join(new_words),
+                            numbers=self.numbers,
+                            number_threshold=self.number_threshold,
+                        )
+                        # NOTE: confidence is the whole utterance's estimate,
+                        # not scoped to just these trailing words -- splitting
+                        # it precisely would need per-token timestamps (the
+                        # ASR result already carries them) rather than the
+                        # single averaged score used here. Duration IS scoped
+                        # correctly via the delta above.
+                        logger.log(
+                            text=formatted,
+                            confidence=update.confidence,
+                            duration=segment_duration,
+                        )
+                        self.line_finalized.emit(formatted)
                     last_emitted_partial = ""
-                    # Store the end of this finalized text to deduplicate the next stream
-                    overlap_memory = raw_words[-5:] if raw_words else []                    
                     return
 
-                
                 # Handle partial updates
                 raw_words = update.partial_text.split()
                 overlap_count = _find_overlap(overlap_memory, raw_words)
-                deduped_text = " ".join(raw_words[overlap_count:])
+                deduped_words = raw_words[overlap_count:]
+                if len(deduped_words) != len(last_known_words):
+                    word_count_history.append((time.perf_counter(), len(deduped_words)))
+                    # Trim history older than we'll ever need to look back.
+                    cutoff = time.perf_counter() - self.speaker_split_backdate_seconds - 2.0
+                    while len(word_count_history) > 1 and word_count_history[0][0] < cutoff:
+                        word_count_history.popleft()
+                last_known_words = deduped_words
+
+                # Only display words after the last UI-only split point, so a
+                # speaker change doesn't leave the previous speaker's words
+                # re-appearing at the front of the new partial line.
+                display_words = deduped_words[pending_ui_offset:]
 
                 now = time.perf_counter()
                 formatted_partial = format_line(
-                    deduped_text,
+                    " ".join(display_words),
                     numbers=self.numbers,
                     number_threshold=self.number_threshold,
                 )
@@ -199,6 +326,81 @@ class PipelineWorker(QThread):
                     self.partial_updated.emit(formatted_partial)
                     last_emitted_partial = formatted_partial
                     last_partial_emit_time = now
+
+            def emit_ui_split() -> None:
+                """Ends the current UI line, backdated by
+                --speaker-split-backdate seconds, WITHOUT touching the ASR
+                backend -- the stream, its endpoint detector, and the
+                audio_history overlap buffer all continue completely
+                undisturbed. Only the display/log layer is split, and only
+                up to where word_count_history says the decode stood
+                self.speaker_split_backdate_seconds seconds ago, not the current instant.
+
+                This replaces the old force_finalize() approach, which reset
+                the ASR stream mid-utterance and lost whatever word(s) the
+                decoder hadn't yet committed at that exact sample. Splitting
+                on the LIVE snapshot (an earlier version of this function)
+                fixed the word-loss but introduced a different problem:
+                the live edge of a streaming decode is often still settling,
+                and the detector itself needs an accumulation window before
+                it fires, so a live split both produced occasional garbled/
+                truncated fragments at the boundary and left some of the
+                incoming speaker's already-decoded words glued onto the
+                outgoing line. Backdating targets an already-settled point
+                in the decode and one that's closer to when the acoustic
+                change actually happened, addressing both at once.
+
+                Any words newer than the backdated point stay pending
+                (pending_ui_offset does NOT advance past them) -- they'll
+                correctly appear at the start of the next line instead of
+                being dropped.
+                """
+                nonlocal pending_ui_offset, last_emitted_partial, total_duration_at_last_split
+
+                if not last_known_words:
+                    return
+
+                target_time = time.perf_counter() - self.speaker_split_backdate_seconds
+                backdated_count = pending_ui_offset  # fallback: no usable history yet
+                for t, count in word_count_history:
+                    if t <= target_time:
+                        backdated_count = count
+                    else:
+                        break
+                split_index = max(pending_ui_offset, min(backdated_count, len(last_known_words)))
+
+                new_words = last_known_words[pending_ui_offset:split_index]
+                if not new_words:
+                    return
+
+                # Approximation: this counts audio time up to NOW, not up to
+                # the backdated split point, so it slightly overstates this
+                # segment's duration (by up to ~self.speaker_split_backdate_seconds seconds).
+                # A precise version would use the ASR's per-token timestamps
+                # to find the exact audio time of the last included word.
+                snapshot = asr.current_snapshot()
+                total_now = snapshot.duration_seconds or 0.0
+                segment_duration = max(total_now - total_duration_at_last_split, 0.0)
+
+                formatted = format_line(
+                    " ".join(new_words),
+                    numbers=self.numbers,
+
+                    number_threshold=self.number_threshold,
+                )
+                logger.log(
+                    text=formatted,
+                    confidence=snapshot.confidence,
+                    duration=segment_duration,
+                )
+                self.line_finalized.emit(formatted)
+
+                # NOT len(last_known_words) -- leave any words newer than
+                # split_index pending so they surface at the start of the
+                # next line instead of being silently swallowed here.
+                pending_ui_offset = split_index
+                total_duration_at_last_split = total_now
+                last_emitted_partial = ""
 
             while not self._stop_requested:
                 if self.capture.error is not None:
@@ -218,14 +420,15 @@ class PipelineWorker(QThread):
                     is_active = gate.is_speech_active()
                     if is_active:
                         if not was_speech_active:
-                            print(f"VAD: {is_active}, pre_roll: {len(pre_roll)}")
                             for chunk in pre_roll:
-                                handle_update(asr.feed(chunk))
+                                process_chunk(chunk)
                             pre_roll.clear()
-                        handle_update(asr.feed(samples))
+                        process_chunk(samples)
                     else:
-                        print(f"VAD: {is_active}, pre_roll: {len(pre_roll)}")
                         pre_roll.append(samples)
+                        if was_speech_active and speaker_service:
+                            speaker_service.reset()
+
                     was_speech_active = is_active
 
                 self.msleep(int(DRAIN_INTERVAL_S * 1000))
