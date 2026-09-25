@@ -32,6 +32,25 @@ class AsrUpdate:
     duration_seconds: Optional[float] = None  # audio duration of the finalized line
 
 
+@dataclass
+class WordTiming:
+    """One word from the CURRENT in-progress line, reconstructed from the
+    recognizer's per-token timestamps. start/end are seconds since this
+    stream was last reset (same time base as AsrUpdate.duration_seconds).
+    confidence is a per-word estimate (geometric mean of that word's token
+    probabilities, same formula StreamingAsrEngine._estimate_confidence
+    uses for a whole utterance) -- None if per-token probabilities weren't
+    available. end is approximated as the START time of the NEXT word
+    (sherpa-onnx only reports token START times, not durations); for the
+    last word in the list, end falls back to that word's own last token's
+    start time, which slightly understates it.
+    """
+    text: str
+    start: float
+    end: float
+    confidence: Optional[float] = None
+
+
 class StreamingAsrEngine:
     def __init__(
         self,
@@ -81,6 +100,7 @@ class StreamingAsrEngine:
         self._audio_history = np.zeros(0, dtype=np.float32)
 
 
+
     def feed(self, samples: np.ndarray) -> AsrUpdate:
         """Feed one chunk of speech audio (caller is responsible for VAD
         gating - don't feed music/silence). Returns the current partial
@@ -124,25 +144,117 @@ class StreamingAsrEngine:
         return AsrUpdate(partial_text=text)
 
     def current_snapshot(self) -> AsrUpdate:
-            """Best-effort look at the in-progress line WITHOUT finalizing or
-            resetting the stream -- doesn't touch decode state at all beyond
-            what feed() already did. Used to support UI-only line breaks (e.g.
-            a detected speaker change) that must not disturb the continuous
-            backend decode: see PipelineWorker.emit_ui_split().
-    
-            duration_seconds here is the total audio fed since the last REAL
-            reset (same accounting as a normal finalize), not scoped to any
-            UI-only split -- callers wanting a duration for just the audio
-            since their last UI split should track the delta between
-            successive calls themselves (PipelineWorker does this).
-            """
-            text = self._recognizer.get_result(self._stream).strip()
-            confidence = self._estimate_confidence(self._stream) if text else None
-            duration = self._samples_fed_since_reset / self.sample_rate if text else None
-            return AsrUpdate(partial_text=text, confidence=confidence, duration_seconds=duration)
+        """Best-effort look at the in-progress line WITHOUT finalizing or
+        resetting the stream -- doesn't touch decode state at all beyond
+        what feed() already did. Used to support UI-only line breaks (e.g.
+        a detected speaker change) that must not disturb the continuous
+        backend decode: see PipelineWorker.emit_ui_split().
+
+        duration_seconds here is the total audio fed since the last REAL
+        reset (same accounting as a normal finalize), not scoped to any
+        UI-only split -- callers wanting a duration for just the audio
+        since their last UI split should track the delta between
+        successive calls themselves (PipelineWorker does this).
+        """
+        text = self._recognizer.get_result(self._stream).strip()
+        confidence = self._estimate_confidence(self._stream) if text else None
+        duration = self._samples_fed_since_reset / self.sample_rate if text else None
+        return AsrUpdate(partial_text=text, confidence=confidence, duration_seconds=duration)
+
+    def current_word_timings(self) -> Optional[list]:
+        """Best-effort per-word (start, end, confidence) for the CURRENT
+        in-progress line, reconstructed from the recognizer's per-token
+        timestamps -- an alternative to current_snapshot()'s wall-clock
+        approximation for UI-only line splitting (see
+        PipelineWorker.emit_ui_split_token_based()). Returns a list of
+        WordTiming, in the same order as text.split() would give.
+
+        Returns None (the caller should fall back to a coarser method) if:
+        - this sherpa-onnx build/result doesn't expose token timestamps
+          under the keys this expects ("tokens", "timestamps");
+        - the tokenizer doesn't use the SentencePiece '\u2581' word-boundary
+          marker this assumes (most sherpa-onnx streaming Zipformer/
+          Nemotron models do, but not guaranteed for every checkpoint) --
+          detected via a sanity check against get_result()'s own word count,
+          since a wrong tokenization convention would badly under- or
+          over-count words.
+
+        This is intentionally conservative: returning None and letting the
+        caller fall back is much safer than silently returning a
+        misaligned word list.
+        """
+        data = None
+        for attr_name in ("get_result_as_json_string", "get_result_all"):
+            method = getattr(self._recognizer, attr_name, None)
+            if method is None:
+                continue
+            try:
+                raw = method(self._stream)
+                data = json.loads(raw) if isinstance(raw, str) else getattr(raw, "__dict__", None)
+                if data:
+                    break
+            except Exception:
+                data = None
+                continue
+        if not data:
+            return None
+
+        tokens = data.get("tokens")
+        timestamps = data.get("timestamps")
+        if not tokens or not timestamps or len(tokens) != len(timestamps):
+            return None
+
+        ys_probs = data.get("ys_probs")
+        if ys_probs is not None and len(ys_probs) != len(tokens):
+            ys_probs = None  # length mismatch -- don't trust it
+
+        words: list = []
+        piece_buf: list = []
+        prob_buf: list = []
+        word_start: Optional[float] = None
+
+        def flush(end_time: float) -> None:
+            if not piece_buf:
+                return
+            text = "".join(piece_buf).replace("\u2581", "").strip()
+            if text:
+                conf = float(np.exp(np.mean(prob_buf))) if prob_buf else None
+                words.append(WordTiming(text=text, start=word_start, end=end_time, confidence=conf))
+            piece_buf.clear()
+            prob_buf.clear()
+
+        for i, tok in enumerate(tokens):
+            is_word_start = tok.startswith("\u2581") or i == 0
+            if is_word_start and piece_buf:
+                flush(end_time=timestamps[i])
+                word_start = timestamps[i]
+            elif word_start is None:
+                word_start = timestamps[i]
+            piece_buf.append(tok)
+            if ys_probs is not None:
+                prob_buf.append(ys_probs[i])
+        flush(end_time=timestamps[-1] if timestamps else (word_start or 0.0))
+
+        # Sanity check: bail out to fallback if the reconstructed word count
+        # is way off from get_result()'s own word count -- a sign the '\u2581'
+        # convention doesn't apply to this model's tokenizer.
+        reference_text = self._recognizer.get_result(self._stream).strip()
+        reference_word_count = len(reference_text.split())
+        if reference_word_count and abs(len(words) - reference_word_count) > max(2, reference_word_count // 4):
+            return None
+
+        return words
 
     def force_finalize(self) -> Optional[AsrUpdate]:
-        """Force finalize current speech segment immediately on speaker change."""
+        """Force finalize current speech segment immediately.
+
+        NOTE: no longer called for speaker-change handling (see
+        PipelineWorker.emit_ui_split() instead) -- resetting the stream
+        here cuts off before the decoder has trailing context to commit
+        its last word(s), which is what was dropping words at each speaker
+        change. Left in place in case you have another use for a genuine
+        forced backend cut; just be aware of that tradeoff if you call it.
+        """
         text = self._recognizer.get_result(self._stream).strip()
         if not text:
             self._recognizer.reset(self._stream)

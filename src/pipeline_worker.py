@@ -89,6 +89,7 @@ class PipelineWorker(QThread):
         std_floor: float = 0.05,
         max_window: int = 20,
         speaker_split_backdate_seconds: float = 0.7,
+        speaker_split_mode: str = "token",  # "wallclock" or "token"
         # Speaker detection parameters
         provider: str = "cpu",
         int8: bool = False,
@@ -123,6 +124,7 @@ class PipelineWorker(QThread):
         self.std_floor = std_floor
         self.max_window = max_window
         self.speaker_split_backdate_seconds = speaker_split_backdate_seconds
+        self.speaker_split_mode = speaker_split_mode
         # Speaker detection parameters
 
         
@@ -327,7 +329,7 @@ class PipelineWorker(QThread):
                     last_emitted_partial = formatted_partial
                     last_partial_emit_time = now
 
-            def emit_ui_split() -> None:
+            def emit_ui_split_wallclock() -> None:
                 """Ends the current UI line, backdated by
                 --speaker-split-backdate seconds, WITHOUT touching the ASR
                 backend -- the stream, its endpoint detector, and the
@@ -349,6 +351,14 @@ class PipelineWorker(QThread):
                 outgoing line. Backdating targets an already-settled point
                 in the decode and one that's closer to when the acoustic
                 change actually happened, addressing both at once.
+
+                CAVEAT (why the "token" mode below exists): this backdate is
+                a WALL-CLOCK approximation of audio time, and it's blind to
+                actual speech rate. Too small and it undershoots (a word or
+                two of the incoming speaker still ends up on this line); too
+                large and it can overshoot (stealing a genuine trailing word
+                that really belonged to the outgoing speaker). There's no
+                fixed value that's simply "correct" here.
 
                 Any words newer than the backdated point stay pending
                 (pending_ui_offset does NOT advance past them) -- they'll
@@ -376,8 +386,7 @@ class PipelineWorker(QThread):
                 # Approximation: this counts audio time up to NOW, not up to
                 # the backdated split point, so it slightly overstates this
                 # segment's duration (by up to ~self.speaker_split_backdate_seconds seconds).
-                # A precise version would use the ASR's per-token timestamps
-                # to find the exact audio time of the last included word.
+                # The "token" mode below computes this precisely instead.
                 snapshot = asr.current_snapshot()
                 total_now = snapshot.duration_seconds or 0.0
                 segment_duration = max(total_now - total_duration_at_last_split, 0.0)
@@ -385,7 +394,6 @@ class PipelineWorker(QThread):
                 formatted = format_line(
                     " ".join(new_words),
                     numbers=self.numbers,
-
                     number_threshold=self.number_threshold,
                 )
                 logger.log(
@@ -401,6 +409,107 @@ class PipelineWorker(QThread):
                 pending_ui_offset = split_index
                 total_duration_at_last_split = total_now
                 last_emitted_partial = ""
+
+            def emit_ui_split_token_based() -> bool:
+                """Same job as emit_ui_split_wallclock(), but the split
+                point, duration, and confidence are all derived from the
+                ASR's actual per-token audio timestamps instead of a
+                wall-clock guess. Two concrete improvements over the
+                wall-clock version when this data is available:
+
+                1. The backdate is anchored to real audio time, not an
+                   assumed real-time processing rate, and doesn't need to
+                   guess how many words fit in N seconds -- it finds the
+                   actual word whose token timestamp is old enough. This
+                   removes the speech-rate sensitivity documented on
+                   emit_ui_split_wallclock().
+                2. duration and confidence are computed from exactly the
+                   words in THIS segment (confidence as the geometric mean
+                   of just those words' token probabilities), not the whole
+                   utterance's cumulative duration / averaged confidence.
+
+                Returns True if it successfully emitted (or correctly
+                determined there was nothing new to emit yet) -- i.e. the
+                caller should NOT fall back. Returns False if the token
+                data wasn't usable (see StreamingAsrEngine.current_word_timings
+                for when that happens), signaling the caller to fall back
+                to emit_ui_split_wallclock().
+                """
+                nonlocal pending_ui_offset, last_emitted_partial, total_duration_at_last_split
+
+                word_timings = asr.current_word_timings()
+                if word_timings is None:
+                    return False
+
+                # Apply the SAME overlap dedup used elsewhere so pending_ui_offset
+                # stays consistent with handle_update's word indexing (both the
+                # partial-display path and the eventual real-finalize path use
+                # this same overlap_memory against the same underlying text).
+                raw_texts = [w.text for w in word_timings]
+                overlap_count = _find_overlap(overlap_memory, raw_texts)
+                deduped_timings = word_timings[overlap_count:]
+
+                if len(deduped_timings) <= pending_ui_offset:
+                    return True  # nothing new yet -- handled, not a fallback case
+
+                audio_now = deduped_timings[-1].end
+                target_time = audio_now - self.speaker_split_backdate_seconds
+
+                split_index = pending_ui_offset
+                for i in range(pending_ui_offset, len(deduped_timings)):
+                    if deduped_timings[i].end <= target_time:
+                        split_index = i + 1
+                    else:
+                        break
+
+                segment_words = deduped_timings[pending_ui_offset:split_index]
+                if not segment_words:
+                    return True  # correctly nothing to emit yet, not a fallback
+
+                new_words = [w.text for w in segment_words]
+                seg_start = segment_words[0].start
+                seg_end = segment_words[-1].end
+                segment_duration = max(seg_end - seg_start, 0.0)
+
+                confs = [w.confidence for w in segment_words if w.confidence is not None]
+                segment_confidence = (sum(confs) / len(confs)) if confs else None
+
+                formatted = format_line(
+                    " ".join(new_words),
+                    numbers=self.numbers,
+                    number_threshold=self.number_threshold,
+                )
+                logger.log(
+                    text=formatted,
+                    confidence=segment_confidence,
+                    duration=segment_duration,
+                )
+                self.line_finalized.emit(formatted)
+
+                pending_ui_offset = split_index
+                total_duration_at_last_split = audio_now
+                last_emitted_partial = ""
+                return True
+
+            def emit_ui_split() -> None:
+                """Dispatches to the token-timestamp method (precise, but
+                depends on assumptions about the installed sherpa-onnx
+                build and the model's tokenizer -- see
+                StreamingAsrEngine.current_word_timings) or the wall-clock
+                method (always available, coarser), per
+                self.speaker_split_mode. token mode falls back to wallclock
+                automatically and prints a note when it does, so a run
+                using 'token' mode that never falls back is a working
+                token-timing path; frequent fallback notices mean the
+                token data isn't usable for this model/build and you may
+                as well set speaker_split_mode='wallclock' outright.
+                """
+                if self.speaker_split_mode == "token":
+                    if emit_ui_split_token_based():
+                        return
+                    print("[SPEAKER SPLIT] token timestamps unavailable/unreliable "
+                          "this time, falling back to wall-clock backdate")
+                emit_ui_split_wallclock()
 
             while not self._stop_requested:
                 if self.capture.error is not None:

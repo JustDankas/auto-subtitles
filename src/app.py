@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--speaker-min-window", type=int, default=3, help="Min window before detection begins")
     parser.add_argument("--speaker-max-window", type=int, default=20, help="Max history window size")
     parser.add_argument("--speaker-split-backdate-seconds", type=float, default=0.7, help="Backdate for speaker change detection (default: 0.4)")
+    parser.add_argument("--speaker-split-mode", type=str, default="token", choices=["wallclock", "token"], help="Speaker change detection mode (default: wallclock)")
     # Number formatting options
     parser.add_argument(
         "--numbers",
@@ -133,6 +134,8 @@ def main() -> None:
         number_threshold=args.number_threshold,
         num_threads=args.num_threads,
         overlap_seconds=args.overlap_seconds,
+        speaker_split_backdate_seconds=args.speaker_split_backdate_seconds,
+        speaker_split_mode=args.speaker_split_mode,
     )
 
     worker.partial_updated.connect(overlay.update_partial)

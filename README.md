@@ -18,6 +18,7 @@ All recognition happens on your machine. No audio leaves it.
 - Captures system audio through WASAPI loopback, so it works with any player or app, with no plugins.
 - Streaming recognition with a Nemotron transducer from [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Text appears while people are still speaking.
 - Silero voice activity detection keeps silence and most music away from the recognizer.
+- Optional speaker-change detection uses WeSpeaker CAM++ embeddings and z-score scoring to split caption lines when the speaker changes. It detects changes, but does not identify speakers by name.
 - Translucent, draggable, always-on-top caption window. Each line fades out after a few seconds.
 - Optional click-through mode (experimental) so clicks reach the app behind the captions.
 - Per-line JSONL log with timestamp, text, confidence, and duration. The logger flushes after each line, so a crash does not lose finished lines.
@@ -91,7 +92,7 @@ After extraction, the extracted `models\nemotron-en-0.6b-560ms-int8-2026-04-25` 
 Using recommended default hyperparameters
 
 ```powershell
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25
 ```
 
 Start any audio on your default output device (a YouTube video works well). Captions appear in the overlay within a few seconds. Drag the bar labeled **Drag to Move** to reposition the captions, and click the **✕** on that bar to quit.
@@ -99,34 +100,41 @@ Start any audio on your default output device (a YouTube video works well). Capt
 More examples:
 
 ```powershell
-# Lower CPU use with the int8 model files
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --int8
+# Speaker-change detection with suggested hyperparameters
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --int8 --speaker-model models\wespeaker_en_voxceleb_CAM++.onnx --speaker-k 1.5 --std-floor 0.125 --speaker-min-window 2 --speaker-max-window 15 --num-threads 4 --speaker-split-backdate-seconds 0.7 --speaker-split-mode token
 
 # Raise the VAD threshold to reject background music, and write to a custom log file
 python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --vad-threshold 0.5 --log-file lecture.jsonl
 
-# Click-through captions, placed near the bottom of a 1080p screen
-python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --click-through --x 510 --y 860
+# With click-through and custom new-utterance text color
+python src/app.py --asr-model-dir models\nemotron-en-0.6b-560ms-int8-2026-04-25 --vad-model models\silero_vad.onnx --click-through --new-text-color 00C3FF
 ```
 
 ### Command-line options
 
-| Option                | Default            | Description                                                                          |
-| --------------------- | ------------------ | ------------------------------------------------------------------------------------ |
-| `--asr-model-dir`     | required           | Folder containing the encoder, decoder, joiner, and `tokens.txt` files.              |
-| `--vad-model`         | `silero_vad.onnx`  | Path to the Silero VAD model.                                                        |
-| `--provider`          | `cpu`              | `cpu` or `cuda`. The CPU path is the tested one.                                     |
-| `--int8`              | off                | Use the int8-quantized model files when the folder has them.                         |
-| `--log-file`          | `transcript.jsonl` | Where finished lines are appended.                                                   |
-| `--vad-threshold`     | `0.15`             | Speech probability cutoff. Raise it to reject music, lower it to catch quiet speech. |
-| `--min-silence`       | `0.5`              | Seconds of silence before the VAD closes a speech region.                            |
-| `--rule2-silence`     | `0.5`              | Seconds of trailing silence that end a caption line.                                 |
-| `--rule3-utterance`   | `12.0`             | Seconds of continuous speech after which a line break is forced.                     |
-| `--new-text-color`    | `#FFFF00`          | Color of the line currently being recognized.                                        |
-| `--old-text-color`    | `#E5E5E5`          | Color of finished lines.                                                             |
-| `--width`, `--height` | `900`, `160`       | Caption window size in pixels.                                                       |
-| `--x`, `--y`          | `100`, `100`       | Initial window position.                                                             |
-| `--click-through`     | off                | Let mouse clicks pass through the caption box. Experimental.                         |
+| Option                             | Default            | Description                                                                          |
+| ---------------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
+| `--asr-model-dir`                  | required           | Folder containing the encoder, decoder, joiner, and `tokens.txt` files.              |
+| `--vad-model`                      | `silero_vad.onnx`  | Path to the Silero VAD model.                                                        |
+| `--provider`                       | `cpu`              | `cpu` or `cuda`. The CPU path is the tested one.                                     |
+| `--int8`                           | off                | Use the int8-quantized model files when the folder has them.                         |
+| `--log-file`                       | `transcript.jsonl` | Where finished lines are appended.                                                   |
+| `--vad-threshold`                  | `0.15`             | Speech probability cutoff. Raise it to reject music, lower it to catch quiet speech. |
+| `--min-silence`                    | `0.5`              | Seconds of silence before the VAD closes a speech region.                            |
+| `--rule2-silence`                  | `0.5`              | Seconds of trailing silence that end a caption line.                                 |
+| `--rule3-utterance`                | `12.0`             | Seconds of continuous speech after which a line break is forced.                     |
+| `--speaker-model`                  | off                | Path to the WeSpeaker/CAM++ ONNX model. Enables speaker-change detection.            |
+| `--speaker-k`                      | `1.5`              | Z-score threshold for declaring an embedding change.                                 |
+| `--std-floor`                      | `0.125`            | Minimum similarity standard deviation used by the detector.                          |
+| `--speaker-min-window`             | `2`                | Embeddings collected before change detection begins.                                 |
+| `--speaker-max-window`             | `15`               | Maximum number of recent embeddings kept for comparison.                             |
+| `--speaker-split-backdate-seconds` | `0.7`              | Backdate used to keep unsettled boundary words with the next line.                   |
+| `--speaker-split-mode`             | `token`            | `token` uses ASR timestamps; `wallclock` uses a wall-clock approximation.            |
+| `--new-text-color`                 | `#FFFF00`          | Color of the line currently being recognized.                                        |
+| `--old-text-color`                 | `#E5E5E5`          | Color of finished lines.                                                             |
+| `--width`, `--height`              | `900`, `160`       | Caption window size in pixels.                                                       |
+| `--x`, `--y`                       | `100`, `100`       | Initial window position.                                                             |
+| `--click-through`                  | off                | Let mouse clicks pass through the caption box. Experimental.                         |
 
 ## Output
 
@@ -161,6 +169,14 @@ SpeechGate              Silero VAD (sherpa-onnx, CPU), 512-sample windows
         |
         |-- speech -----> StreamingAsrEngine    Nemotron transducer, greedy search, endpoint detection
                                 |
+                                |-- same speech audio --> SpeakerEmbeddingService (optional CAM++)
+                                |                              |
+                                |                              v
+                                |                      InstantChangeDetector
+                                |                      z-score over recent embeddings
+                                |                              |
+                                |                  speaker change --> UI/log line split
+                                |
                                 |-- partial text, throttled to 4 updates/s --> overlay (current line)
                                 |-- finalized line --> text_formatter --> overlay + TranscriptLogger (JSONL)
 ```
@@ -169,18 +185,19 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 
 ### Modules
 
-| File                   | Role                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------------------------------ |
-| `audio_capture.py`     | WASAPI loopback capture through PyAudioWPatch, plus downmix and resampling.                      |
-| `ring_buffer.py`       | Thread-safe circular buffer with dropped-audio counters.                                         |
-| `vad_gate.py`          | Wraps sherpa-onnx's Silero VAD and buffers arbitrary-length input into exact 512-sample windows. |
-| `asr_engine.py`        | Persistent `OnlineStream` with endpoint detection and a confidence estimate.                     |
-| `pipeline_worker.py`   | The `QThread` that connects capture, VAD, ASR, and logging, and emits GUI signals.               |
-| `text_formatter.py`    | Capitalization heuristic for the model's all-caps output.                                        |
-| `transcript_logger.py` | Console and JSONL logging, flushed per line.                                                     |
-| `overlay_window.py`    | Caption window with per-line boxes that fade and shrink.                                         |
-| `drag_handle.py`       | Separate always-interactive window for dragging and closing.                                     |
-| `app.py`               | Entry point: parses arguments, wires signals, starts the worker.                                 |
+| File                   | Role                                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| `audio_capture.py`     | WASAPI loopback capture through PyAudioWPatch, plus downmix and resampling.                           |
+| `ring_buffer.py`       | Thread-safe circular buffer with dropped-audio counters.                                              |
+| `vad_gate.py`          | Wraps sherpa-onnx's Silero VAD and buffers arbitrary-length input into exact 512-sample windows.      |
+| `asr_engine.py`        | Persistent `OnlineStream` with endpoint detection and a confidence estimate.                          |
+| `pipeline_worker.py`   | The `QThread` that connects capture, VAD, ASR, and logging, and emits GUI signals.                    |
+| `speaker_detector.py`  | Accumulates speech for CAM++ embeddings and detects changes with a rolling cosine-similarity z-score. |
+| `text_formatter.py`    | Number formatter that handles years, fractions, thousands.                                            |
+| `transcript_logger.py` | Console and JSONL logging, flushed per line.                                                          |
+| `overlay_window.py`    | Caption window with per-line boxes that fade and shrink.                                              |
+| `drag_handle.py`       | Separate always-interactive window for dragging and closing.                                          |
+| `app.py`               | Entry point: parses arguments, wires signals, starts the worker.                                      |
 
 ### Design decisions
 
@@ -196,15 +213,22 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 
 **The overlay uses two windows.** On Windows, click-through applies to a whole native window, so one window cannot be half click-through. The caption box can be click-through while the small drag handle stays interactive, which lets you move or close the app at any time.
 
+**Speaker changes split the display without resetting ASR.** When `--speaker-model` is enabled, the worker feeds the same VAD-approved speech audio to the CAM++ embedding extractor. `InstantChangeDetector` compares each normalized embedding with a rolling window of recent embeddings. When the similarity z-score exceeds `--speaker-k`, the current caption line is finalized for display and logging, but the recognizer stream, endpoint detector, and audio overlap history continue uninterrupted. This avoids dropping words at a speaker boundary.
+
+The split point is backdated by `--speaker-split-backdate-seconds` so unsettled decoder output and audio from the incoming speaker are not attached to the previous line. In `token` mode, the worker uses the recognizer's per-token timestamps and per-word confidence when available. If the installed sherpa-onnx build does not expose usable token data, it automatically falls back to the `wallclock` approximation. Speaker changes do not add speaker labels to the JSONL output.
+
 ## Tuning
 
-| Symptom                                       | Try                                              |
-| --------------------------------------------- | ------------------------------------------------ |
-| Captions appear for music or background noise | Raise `--vad-threshold` to 0.4 or 0.6.           |
-| Quiet speech is missed                        | Lower `--vad-threshold` to 0.1 or 0.3.           |
-| Captions lag behind the speaker               | Lower `--rule2-silence` and `--rule3-utterance`. |
-| Sentences split in the middle                 | Raise `--rule2-silence` and `--min-silence`.     |
-| CPU usage is high                             | Add `--int8`.                                    |
+| Symptom                                       | Try                                                                                                              |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Captions appear for music or background noise | Raise `--vad-threshold` to 0.4 or 0.6.                                                                           |
+| Quiet speech is missed                        | Lower `--vad-threshold` to 0.1 or 0.3.                                                                           |
+| Captions lag behind the speaker               | Lower `--rule2-silence` and `--rule3-utterance`.                                                                 |
+| Sentences split in the middle                 | Raise `--rule2-silence` and `--min-silence`.                                                                     |
+| CPU usage is high                             | Add `--int8`.                                                                                                    |
+| Speaker changes are missed                    | Lower `--speaker-k`, lower `--std-floor`, or increase `--speaker-max-window`.                                    |
+| Speaker lines split too often                 | Raise `--speaker-k` or `--std-floor`; increase `--speaker-min-window`.                                           |
+| Speaker split boundaries feel early or late   | Adjust `--speaker-split-backdate-seconds`; use `--speaker-split-mode token` when token timestamps are available. |
 
 ## Troubleshooting
 
@@ -228,6 +252,10 @@ This mode uses `Qt.WindowType.WindowTransparentForInput`, and I have not verifie
 
 **`--provider cuda` fails**
 The CUDA path is untested. I could not get it working on a GTX 1070, and CPU inference was fast enough that I stopped pursuing it.
+
+**Speaker detection falls back from token mode**
+
+The `token` mode requires a sherpa-onnx build that exposes per-token timestamps in the recognizer result, and a tokenizer whose word-boundary markers can be reconstructed reliably. When those conditions are not met, the app prints a notice and uses the wall-clock backdate automatically. This affects split precision, not ASR recognition.
 
 ## Limitations
 
