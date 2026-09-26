@@ -53,8 +53,8 @@ def format_line(
         text = alpha2digit(text, "en", threshold=number_threshold)
         text = _format_decimals(text)
         # text = _combine_cued_years(text)
-        text = _combine_isolated_2digit_pairs(text)
         text = _add_thousands_separators(text)
+        text = _combine_isolated_2digit_pairs(text)
     text = text[0].upper() + text[1:]
     text = _STANDALONE_I.sub("I", text)
     return text

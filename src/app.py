@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--num-threads", type=int, default=3)
     parser.add_argument("--log-file", type=str, default="logs\\transcript.jsonl")
     parser.add_argument("--vad-threshold", type=float, default=0.2)
-    parser.add_argument("--min-silence", type=float, default=1.2, help="Seconds of silence to consider a line ended (default: 0.5)")
+    parser.add_argument("--min-silence", type=float, default=0.5, help="Seconds of silence to consider a line ended (default: 0.5)")
     parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
     parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 20.0)")
     parser.add_argument("--overlap-seconds", type=float, default=1.0, help="Seconds of audio overlap to feed into the next line when rule3 is triggered (default: 1.0)")
