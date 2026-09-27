@@ -3,17 +3,18 @@ import torch.nn as nn
 
 
 class CausalConv1dBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation=1):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation=1, dropout=0.15):
         super().__init__()
         self.pad = (kernel_size - 1) * dilation
         self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
         self.norm = nn.BatchNorm1d(out_ch)
         self.act = nn.ReLU()
-        
+        self.dropout = nn.Dropout(dropout)
+
 
     def forward(self, x):  # x: (B, C, T)
         x = nn.functional.pad(x, (self.pad, 0))  # left-pad only -> causal
-        return self.act(self.norm(self.conv(x)))
+        return self.dropout(self.act(self.norm(self.conv(x))))
 
 
 def cnn_receptive_field(num_layers: int, kernel_size: int, dilation_base: int = 2) -> int:
