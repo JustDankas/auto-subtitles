@@ -1,6 +1,8 @@
 import argparse
+import itertools
 import os
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -8,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import soundfile as sf
+from tqdm import tqdm
 
 SAMPLE_RATE = 16000
 
@@ -149,7 +152,7 @@ def _save_window(
 
 
 # ---------------------------------------------------------------------------
-# NEW: fixed-duration, single-change (or no-change) window generation
+# FIXED-DURATION SINGLE-CHANGE (OR NO-CHANGE) WINDOW GENERATION
 # ---------------------------------------------------------------------------
 def concat_clips_to_duration(
     clips: List[str],
@@ -212,6 +215,7 @@ def build_change_window(
     (the new speaker's) conceptual start, matching derive_change_points'
     definition used everywhere else in this file.
     """
+
     a_end_s = change_time_s - gap_seconds
     b_dur_s = window_duration_s - change_time_s
     if a_end_s <= 0 or b_dur_s <= 0:
@@ -273,12 +277,102 @@ def build_no_change_window(
     ]
     return canvas, turns
 
+# ---------------------------------------------------------------------------
+# WORKER FUNCTIONS FOR PARALLEL EXECUTION
+# ---------------------------------------------------------------------------
+
+def _process_change_window_job(job_args: dict) -> List[dict]:
+    """
+    Worker task: generates and saves a single change window.
+    """
+    # Unpack parameters
+    window_id = job_args["window_id"]
+    output_dir = job_args["output_dir"]
+    speaker_clips = job_args["speaker_clips"]
+    speaker_a = job_args["speaker_a"]
+    speaker_b = job_args["speaker_b"]
+    window_duration_s = job_args["window_duration_s"]
+    min_segment_s = job_args["min_segment_s"]
+    change_position_step_s = job_args["change_position_step_s"]
+    change_position_jitter_s = job_args["change_position_jitter_s"]
+    gap_options = job_args["gap_options"]
+    noise_options = job_args["noise_options"]
+    noise_probs = job_args["noise_probs"]
+    frame_hop_ms = job_args["frame_hop_ms"]
+    label_tolerance_ms = job_args["label_tolerance_ms"]
+    clip_cursors = job_args["clip_cursors"]
+    worker_seed = job_args["seed"]
+
+    rng = random.Random(worker_seed)
+    
+    positions = np.arange(
+        min_segment_s, window_duration_s - min_segment_s + 1e-9, change_position_step_s
+    )
+
+    manifest_rows = []
+    
+    for idx, base_pos in enumerate(positions):
+        sub_id = f"{window_id:06d}_{idx}"
+        jitter = rng.uniform(-change_position_jitter_s, change_position_jitter_s)
+        change_time_s = float(
+            np.clip(base_pos + jitter, min_segment_s, window_duration_s - min_segment_s)
+        )
+        gap_seconds = rng.choice(gap_options)
+        noise_level = rng.choices(noise_options, weights=noise_probs, k=1)[0]
+
+        name = f"win_change_{sub_id}"
+        audio, turns = build_change_window(
+            speaker_clips, speaker_a, speaker_b, window_duration_s,
+            change_time_s, gap_seconds, noise_level, clip_cursors,
+        )
+        for t in turns:
+            t.file_id = name
+        _save_window(output_dir, name, audio, turns, window_duration_s, frame_hop_ms, label_tolerance_ms)
+        manifest_rows.extend([t.__dict__ for t in turns])
+
+    return manifest_rows
+
+
+def _process_no_change_window_job(job_args: dict) -> List[dict]:
+    """
+    Worker task: generates and saves a single no-change window.
+    """
+    window_id = job_args["window_id"]
+    output_dir = job_args["output_dir"]
+    speaker_clips = job_args["speaker_clips"]
+    speaker = job_args["speaker"]
+    window_duration_s = job_args["window_duration_s"]
+    noise_options = job_args["noise_options"]
+    noise_probs = job_args["noise_probs"]
+    frame_hop_ms = job_args["frame_hop_ms"]
+    label_tolerance_ms = job_args["label_tolerance_ms"]
+    clip_cursor = job_args["clip_cursor"]
+    worker_seed = job_args["seed"]
+
+    rng = random.Random(worker_seed)
+    noise_level = rng.choices(noise_options, weights=noise_probs, k=1)[0]
+    name = f"win_nochange_{window_id:06d}"
+
+    # Minimal cursor state dictionary for single-speaker processing
+    cursor_dict = {speaker: clip_cursor}
+    audio, turns = build_no_change_window(
+        speaker_clips, speaker, window_duration_s, noise_level, cursor_dict
+    )
+    for t in turns:
+        t.file_id = name
+    _save_window(output_dir, name, audio, turns, window_duration_s, frame_hop_ms, label_tolerance_ms)
+    
+    return [t.__dict__ for t in turns]
+
+# ---------------------------------------------------------------------------
+# MAIN PARALLEL GENERATOR
+# ---------------------------------------------------------------------------
 
 def generate_window_dataset(
     speaker_clips: Dict[str, List[str]],
     output_dir: str,
     window_duration_s: float = 3.0,
-    min_segment_s: float = 0.5,
+    min_segment_s: float = 1.0,
     change_position_step_s: float = 0.5,
     change_position_jitter_s: float = 0.15,
     change_fraction: float = 0.5,
@@ -289,270 +383,237 @@ def generate_window_dataset(
     frame_hop_ms: float = 10.0,
     label_tolerance_ms: float = 150.0,
     seed: int = 42,
+    num_workers: int = None,  # Defaults to CPU core count
 ) -> None:
-    """
-    Replaces the multi-turn session generator for classifier training: every
-    output file is a standalone `window_duration_s`-long clip containing
-    *at most one* speaker change, so there is never a risk of two changes
-    confusing the model within a single training example.
-
-    For each of `num_pairs` speaker pairs, generates one window per position
-    in `change_position_step_s`-spaced steps across the window (with small
-    random jitter) -- e.g. for a 3.0s window, 0.5s min_segment and 0.5s step:
-    change points at roughly 0.5, 1.0, 1.5, 2.0, 2.5s. This deliberately
-    covers the realistic range of "how long ago did the change happen"
-    a trailing window sees in production, instead of only ever training on
-    a change sitting at the window's midpoint.
-
-    `change_fraction` controls what fraction of the final dataset has a
-    change at all; the remainder are pure single-speaker no-change windows.
-    """
     rng = random.Random(seed)
-    speakers = [s for s in speaker_clips if len(speaker_clips[s]) >= 1]
+    speakers = sorted([s for s in speaker_clips if len(speaker_clips[s]) >= 1])
     if len(speakers) < 2:
         raise ValueError("Need at least 2 speakers with clips to build change windows")
-
-    max_gap_abs = min_segment_s * 0.4
-    bad_gaps = [g for g in gap_options if abs(g) > max_gap_abs]
-    if bad_gaps:
-        raise ValueError(
-            f"gap_options {bad_gaps} exceed +-{max_gap_abs:.2f}s (0.4 * min_segment_s) -- "
-            "a gap/overlap this large relative to min_segment_s risks eating all of the "
-            "guaranteed clean audio on one side of the change. Increase min_segment_s or "
-            "shrink these gap values."
-        )
-
-    positions = np.arange(
-        min_segment_s, window_duration_s - min_segment_s + 1e-9, change_position_step_s
-    )
-    if len(positions) == 0:
-        raise ValueError(
-            "No valid change positions: window_duration_s - 2*min_segment_s must be >= 0"
-        )
 
     os.makedirs(os.path.join(output_dir, "audio"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "labels"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "annotations"), exist_ok=True)
 
-    manifest_rows: List[GroundTruthTurn] = []
-    clip_cursor: Dict[str, int] = {}
-    window_id = 0
+    unique_speaker_pairs = list(itertools.combinations(speakers, 2))
+    rng.shuffle(unique_speaker_pairs)
+    pair_pool = itertools.cycle(unique_speaker_pairs)
 
-    for _ in range(num_pairs):
-        speaker_a, speaker_b = rng.sample(speakers, 2)
-        for base_pos in positions:
-            jitter = rng.uniform(-change_position_jitter_s, change_position_jitter_s)
-            change_time_s = float(
-                np.clip(base_pos + jitter, min_segment_s, window_duration_s - min_segment_s)
-            )
-            gap_seconds = rng.choice(gap_options)
-            noise_level = rng.choices(noise_options, weights=noise_probs, k=1)[0]
+    # Pre-calculate jobs to pass to workers
+    clip_cursors: Dict[str, int] = {s: 0 for s in speakers}
+    change_jobs = []
 
-            name = f"win_change_{window_id:06d}"
-            audio, turns = build_change_window(
-                speaker_clips, speaker_a, speaker_b, window_duration_s,
-                change_time_s, gap_seconds, noise_level, clip_cursor,
-            )
-            for t in turns:
-                t.file_id = name
-            _save_window(output_dir, name, audio, turns, window_duration_s, frame_hop_ms, label_tolerance_ms)
-            manifest_rows.extend(turns)
-            window_id += 1
+    for i in range(num_pairs):
+        speaker_a, speaker_b = next(pair_pool)
+        if rng.random() > 0.5:
+            speaker_a, speaker_b = speaker_b, speaker_a
 
-    num_change = window_id
-    num_no_change = int(round(num_change * (1 - change_fraction) / max(change_fraction, 1e-9)))
-    for _ in range(num_no_change):
-        speaker = rng.choice(speakers)
-        noise_level = rng.choices(noise_options, weights=noise_probs, k=1)[0]
-        name = f"win_nochange_{window_id:06d}"
-        audio, turns = build_no_change_window(
-            speaker_clips, speaker, window_duration_s, noise_level, clip_cursor
-        )
-        for t in turns:
-            t.file_id = name
-        _save_window(output_dir, name, audio, turns, window_duration_s, frame_hop_ms, label_tolerance_ms)
-        manifest_rows.extend(turns)
-        window_id += 1
+        job_args = {
+            "window_id": i,
+            "output_dir": output_dir,
+            "speaker_clips": speaker_clips,
+            "speaker_a": speaker_a,
+            "speaker_b": speaker_b,
+            "window_duration_s": window_duration_s,
+            "min_segment_s": min_segment_s,
+            "change_position_step_s": change_position_step_s,
+            "change_position_jitter_s": change_position_jitter_s,
+            "gap_options": gap_options,
+            "noise_options": noise_options,
+            "noise_probs": noise_probs,
+            "frame_hop_ms": frame_hop_ms,
+            "label_tolerance_ms": label_tolerance_ms,
+            "clip_cursors": {
+                speaker_a: clip_cursors[speaker_a],
+                speaker_b: clip_cursors[speaker_b],
+            },
+            "seed": seed + i,
+        }
+        
+        # Advance local clip offsets deterministicly
+        clip_cursors[speaker_a] += 2
+        clip_cursors[speaker_b] += 2
+        change_jobs.append(job_args)
 
-    df = pd.DataFrame([t.__dict__ for t in manifest_rows])
+    # Determine total no-change windows needed
+    positions_per_pair = len(
+        np.arange(min_segment_s, window_duration_s - min_segment_s + 1e-9, change_position_step_s)
+    )
+    total_change_windows = num_pairs * positions_per_pair
+    num_no_change = int(round(total_change_windows * (1 - change_fraction) / max(change_fraction, 1e-9)))
+
+    no_change_jobs = []
+    speaker_pool = itertools.cycle(speakers)
+    
+    for i in range(num_no_change):
+        speaker = next(speaker_pool)
+        job_args = {
+            "window_id": i,
+            "output_dir": output_dir,
+            "speaker_clips": speaker_clips,
+            "speaker": speaker,
+            "window_duration_s": window_duration_s,
+            "noise_options": noise_options,
+            "noise_probs": noise_probs,
+            "frame_hop_ms": frame_hop_ms,
+            "label_tolerance_ms": label_tolerance_ms,
+            "clip_cursor": clip_cursors[speaker],
+            "seed": seed + num_pairs + i,
+        }
+        clip_cursors[speaker] += 2
+        no_change_jobs.append(job_args)
+
+    manifest_rows = []
+
+    # Calculate exact total change windows for tqdm
+    total_change_windows = num_pairs * positions_per_pair
+    
+    # Run Change Windows in Parallel
+    print(f"Generating change windows using ProcessPoolExecutor ({num_workers or 'all'} cores)...")
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_process_change_window_job, job) for job in change_jobs]
+        with tqdm(total=total_change_windows, desc="Change Windows") as pbar:
+            for future in as_completed(futures):
+                rows = future.result()
+                manifest_rows.extend(rows)
+                pbar.update(positions_per_pair)
+
+    # Run No-Change Windows in Parallel
+    print(f"Generating no-change windows...")
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_process_no_change_window_job, job) for job in no_change_jobs]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="No-Change Windows"):
+            manifest_rows.extend(future.result())
+
+    df = pd.DataFrame(manifest_rows)
     df.to_csv(os.path.join(output_dir, "annotations", "manifest.csv"), index=False)
-    print(
-        f"Generated {num_change} change windows + {num_no_change} no-change windows "
-        f"({window_id} total) in '{output_dir}'"
-    )
+    print(f"Done! Generated dataset in '{output_dir}'.")
 
+# def generate_window_dataset(
+#     speaker_clips: Dict[str, List[str]],
+#     output_dir: str,
+#     window_duration_s: float = 3.0,
+#     min_segment_s: float = 0.5,
+#     change_position_step_s: float = 0.5,
+#     change_position_jitter_s: float = 0.15,
+#     change_fraction: float = 0.5,
+#     gap_options: Tuple[float, ...] = (-0.2, -0.1, 0.0, 0.0, 0.0, 0.1, 0.2),
+#     noise_options: Tuple[str, ...] = ("zero", "mild", "moderate"),
+#     noise_probs: Tuple[float, ...] = (0.5, 0.25, 0.25),
+#     num_pairs: int = 300,
+#     frame_hop_ms: float = 10.0,
+#     label_tolerance_ms: float = 150.0,
+#     seed: int = 42,
+# ) -> None:
+#     """
+#     Replaces the multi-turn session generator for classifier training: every
+#     output file is a standalone `window_duration_s`-long clip containing
+#     *at most one* speaker change, so there is never a risk of two changes
+#     confusing the model within a single training example.
 
-# ---------------------------------------------------------------------------
-# EXISTING: multi-turn continuous session generator (kept for other uses --
-# e.g. Plan 1/Plan 3 full-session evaluation still wants realistic long
-# multi-speaker recordings; only the *classifier* training data moved to
-# fixed windows above).
-# ---------------------------------------------------------------------------
-def build_continuous_synthetic_session(
-    speaker_clips: Dict[str, List[str]],
-    name: str,
-    num_speakers: int,
-    gap_seconds: float,
-    turns_per_speaker: int = 4,
-    run_length_range: Tuple[int, int] = (1, 3),
-    seed: int = 0,
-    noise_level: str = "zero",
-) -> SyntheticSessionResult:
-    """
-    Constructs a single continuously-mixed WAV track and corresponding ground truth turns.
-    Handles gaps, exact boundaries (0s), and negative overlaps by adding floating-point
-    waveforms directly together.
-    """
-    rng = random.Random(seed)
-    available = [s for s in speaker_clips if len(speaker_clips[s]) >= 2]
-    if len(available) < num_speakers:
-        raise ValueError(
-            f"Need {num_speakers} speakers with >= 2 clips, only found {len(available)}"
-        )
+#     For each of `num_pairs` speaker pairs, generates one window per position
+#     in `change_position_step_s`-spaced steps across the window (with small
+#     random jitter) -- e.g. for a 3.0s window, 0.5s min_segment and 0.5s step:
+#     change points at roughly 0.5, 1.0, 1.5, 2.0, 2.5s. This deliberately
+#     covers the realistic range of "how long ago did the change happen"
+#     a trailing window sees in production, instead of only ever training on
+#     a change sitting at the window's midpoint.
 
-    chosen = rng.sample(available, k=num_speakers)
-    shuffled_clips = {s: rng.sample(speaker_clips[s], k=len(speaker_clips[s])) for s in chosen}
-    clip_idx = {s: 0 for s in chosen}
+#     `change_fraction` controls what fraction of the final dataset has a
+#     change at all; the remainder are pure single-speaker no-change windows.
+#     """
 
-    total_budget = turns_per_speaker * num_speakers
-    turns: List[GroundTruthTurn] = []
-    audio_placements: List[Tuple[int, int, np.ndarray]] = []
+#     rng = random.Random(seed)
+#     speakers = sorted([s for s in speaker_clips if len(speaker_clips[s]) >= 1])
+#     if len(speakers) < 2:
+#         raise ValueError("Need at least 2 speakers with clips to build change windows")
 
-    current_sample_cursor = 0
-    prev_speaker = None
-    total_turns = 0
+#     max_gap_abs = min_segment_s * 0.4
+#     bad_gaps = [g for g in gap_options if abs(g) > max_gap_abs]
+#     if bad_gaps:
+#         raise ValueError(
+#             f"gap_options {bad_gaps} exceed +-{max_gap_abs:.2f}s (0.4 * min_segment_s) -- "
+#             "a gap/overlap this large relative to min_segment_s risks eating all of the "
+#             "guaranteed clean audio on one side of the change. Increase min_segment_s or "
+#             "shrink these gap values."
+#         )
 
-    while total_turns < total_budget:
-        candidates = [s for s in chosen if s != prev_speaker] if prev_speaker else chosen
-        spk = rng.choice(candidates)
-        run_len = rng.randint(*run_length_range)
+#     positions = np.arange(
+#         min_segment_s, window_duration_s - min_segment_s + 1e-9, change_position_step_s
+#     )
+#     if len(positions) == 0:
+#         raise ValueError(
+#             "No valid change positions: window_duration_s - 2*min_segment_s must be >= 0"
+#         )
 
-        for _ in range(run_len):
-            if total_turns >= total_budget:
-                break
+#     os.makedirs(os.path.join(output_dir, "audio"), exist_ok=True)
+#     os.makedirs(os.path.join(output_dir, "labels"), exist_ok=True)
+#     os.makedirs(os.path.join(output_dir, "annotations"), exist_ok=True)
 
-            clips = shuffled_clips[spk]
-            path = clips[clip_idx[spk] % len(clips)]
-            clip_idx[spk] += 1
+#     manifest_rows: List[GroundTruthTurn] = []
+#     clip_cursor: Dict[str, int] = {}
+#     window_id = 0
 
-            raw_audio = load_wav_mono16k(path)
-            norm_audio = normalize_lufs(raw_audio, target_db=-23.0)
-            clip_samples = len(norm_audio)
+#     # 1. Generate all unique speaker combinations (unordered pairs)
+#     unique_speaker_pairs = list(itertools.combinations(speakers, 2))
+#     rng.shuffle(unique_speaker_pairs)
 
-            if total_turns > 0:
-                offset_samples = int(gap_seconds * SAMPLE_RATE)
-                current_sample_cursor += offset_samples
-                current_sample_cursor = max(0, current_sample_cursor)
+#     # 2. Cycle through unique speaker pairs until num_pairs count is satisfied
+#     pair_pool = itertools.cycle(unique_speaker_pairs)
 
-            start_sample = current_sample_cursor
-            end_sample = start_sample + clip_samples
+#     # tqdm
+#     pairs_tqdm = tqdm(range(num_pairs), desc="Generating change windows")
+#     for _ in pairs_tqdm:
+#         speaker_a, speaker_b = next(pair_pool)
+        
+#         # Randomize direction (A->B or B->A)
+#         if rng.random() > 0.5:
+#             speaker_a, speaker_b = speaker_b, speaker_a
 
-            start_s = round(start_sample / SAMPLE_RATE, 3)
-            end_s = round(end_sample / SAMPLE_RATE, 3)
+#         for base_pos in positions:
+#             jitter = rng.uniform(-change_position_jitter_s, change_position_jitter_s)
+#             change_time_s = float(
+#                 np.clip(base_pos + jitter, min_segment_s, window_duration_s - min_segment_s)
+#             )
+#             gap_seconds = rng.choice(gap_options)
+#             noise_level = rng.choices(noise_options, weights=noise_probs, k=1)[0]
 
-            is_overlap = gap_seconds < 0.0 and prev_speaker is not None and (prev_speaker != spk)
+#             name = f"win_change_{window_id:06d}"
+#             audio, turns = build_change_window(
+#                 speaker_clips, speaker_a, speaker_b, window_duration_s,
+#                 change_time_s, gap_seconds, noise_level, clip_cursor,
+#             )
+#             for t in turns:
+#                 t.file_id = name
+#             _save_window(output_dir, name, audio, turns, window_duration_s, frame_hop_ms, label_tolerance_ms)
+#             manifest_rows.extend(turns)
+#             window_id += 1
 
-            turns.append(
-                GroundTruthTurn(
-                    file_id=name,
-                    start_s=start_s,
-                    end_s=end_s,
-                    speaker_id=spk,
-                    has_overlap=is_overlap,
-                    noise_level=noise_level,
-                    notes=f"gap={gap_seconds}s",
-                )
-            )
+#     num_change = window_id
+#     num_no_change = int(round(num_change * (1 - change_fraction) / max(change_fraction, 1e-9)))
+    
+#     # Cycle through single speakers evenly for no-change windows
+#     speaker_pool = itertools.cycle(speakers)
+#     # tqdm
+#     no_change_tqdm = tqdm(range(num_no_change), desc="Generating no-change windows")
+#     for _ in no_change_tqdm:
+#         speaker = next(speaker_pool)
+#         noise_level = rng.choices(noise_options, weights=noise_probs, k=1)[0]
+#         name = f"win_nochange_{window_id:06d}"
+#         audio, turns = build_no_change_window(
+#             speaker_clips, speaker, window_duration_s, noise_level, clip_cursor
+#         )
+#         for t in turns:
+#             t.file_id = name
+#         _save_window(output_dir, name, audio, turns, window_duration_s, frame_hop_ms, label_tolerance_ms)
+#         manifest_rows.extend(turns)
+#         window_id += 1
 
-            audio_placements.append((start_sample, end_sample, norm_audio))
-
-            current_sample_cursor = end_sample
-            prev_speaker = spk
-            total_turns += 1
-
-    max_sample_len = max(end for _, end, _ in audio_placements)
-    canvas = np.zeros(max_sample_len, dtype=np.float32)
-
-    for start, end, chunk in audio_placements:
-        canvas[start:end] += chunk
-
-    canvas = apply_background_noise(canvas, noise_level)
-    canvas = prevent_clipping(canvas)
-
-    return SyntheticSessionResult(
-        session_name=name,
-        audio_data=canvas,
-        sample_rate=SAMPLE_RATE,
-        noise_level=noise_level,
-        turns=turns,
-    )
-
-
-def generate_and_save_suite(
-    speaker_clips: Dict[str, List[str]],
-    output_dir: str,
-    seed: int = 42,
-    count: int = 4,
-    frame_hop_ms: float = 10.0,
-    label_tolerance_ms: float = 150.0,
-):
-    """
-    Multi-scenario continuous-session generation (unchanged behavior from
-    before, aside from frame_hop_ms/label_tolerance_ms now being explicit
-    parameters instead of reaching for the module-level `args`).
-    """
-    os.makedirs(os.path.join(output_dir, "audio"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "annotations"), exist_ok=True)
-
-    configs = [
-        # (num_speakers, turns_per_spk, gap_seconds, count, run_range)
-        (4, 5, -1.00, count, (1, 3)),
-        (4, 5, -0.50, count, (1, 3)),
-        (4, 5, 0.25, count, (1, 3)),
-        (4, 5, 0.00, count, (1, 3)),
-    ]
-
-    noise_options = ["zero", "mild", "moderate"]
-    noise_probs = [0.50, 0.25, 0.25]
-
-    all_turns: List[GroundTruthTurn] = []
-    session_id = 0
-    rng = random.Random(seed)
-
-    for num_speakers, turns, gap, n, run_range in configs:
-        for i in range(n):
-            selected_noise = rng.choices(noise_options, weights=noise_probs, k=1)[0]
-            session_name = f"synth_spk{num_speakers}_gap{gap:.2f}_noise-{selected_noise}_{i}"
-
-            result = build_continuous_synthetic_session(
-                speaker_clips=speaker_clips,
-                name=session_name,
-                num_speakers=num_speakers,
-                gap_seconds=gap,
-                turns_per_speaker=turns,
-                run_length_range=run_range,
-                seed=seed + session_id,
-                noise_level=selected_noise,
-            )
-
-            wav_path = os.path.join(output_dir, "audio", f"{session_name}.wav")
-            sf.write(wav_path, result.audio_data, result.sample_rate)
-
-            os.makedirs(os.path.join(output_dir, "labels"), exist_ok=True)
-            duration_s = len(result.audio_data) / result.sample_rate
-            labels = export_frame_labels(
-                result.turns, duration_s, frame_hop_ms=frame_hop_ms, tolerance_ms=label_tolerance_ms
-            )
-            np.save(os.path.join(output_dir, "labels", f"{session_name}.npy"), labels)
-
-            all_turns.extend(result.turns)
-            session_id += 1
-
-    df = pd.DataFrame([t.__dict__ for t in all_turns])
-    csv_path = os.path.join(output_dir, "annotations", "manifest.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"Generated {session_id} synthetic sessions in '{output_dir}'.")
-    print(f"Master CSV written to: {csv_path}")
+#     df = pd.DataFrame([t.__dict__ for t in manifest_rows])
+#     df.to_csv(os.path.join(output_dir, "annotations", "manifest.csv"), index=False)
+#     print(
+#         f"Generated {num_change} change windows + {num_no_change} no-change windows "
+#         f"({window_id} total) in '{output_dir}'"
+#     )
 
 
 def load_speaker_clips(data_dir: str) -> Dict[str, List[str]]:
@@ -563,8 +624,35 @@ def load_speaker_clips(data_dir: str) -> Dict[str, List[str]]:
             wav_files = sorted(str(p) for p in speaker_dir.glob("*.wav"))
             if wav_files:
                 clips_db[speaker_dir.name] = wav_files
-    return clips_db
+    return clips_db 
 
+def generate_and_save_suite(
+        data_dir: str,
+        output_dir: str,
+        window_duration_s: float = 3.0,
+        min_segment_s: float = 1.0,
+        change_position_step_s: float = 0.5,
+        change_position_jitter_s: float = 0.15,
+        change_fraction: float = 0.5,
+        num_pairs: int = 300,
+        frame_hop_ms: float = 10.0,
+        label_tolerance_ms: float = 150.0,
+        seed: int = 42,
+):
+    clips_db = load_speaker_clips(data_dir)
+    generate_window_dataset(
+        clips_db,
+        output_dir=output_dir,
+        window_duration_s=window_duration_s,
+        min_segment_s=min_segment_s,
+        change_position_step_s=change_position_step_s,
+        change_position_jitter_s=change_position_jitter_s,
+        change_fraction=change_fraction,
+        num_pairs=num_pairs,
+        frame_hop_ms=frame_hop_ms,
+        label_tolerance_ms=label_tolerance_ms,
+        seed=seed,
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -574,13 +662,6 @@ if __name__ == "__main__":
     parser.add_argument("--label-tolerance-ms", type=float, default=150.0)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument(
-        "--mode", choices=["windows", "sessions"], default="windows",
-        help="'windows' (default): fixed-duration single-change/no-change clips for "
-        "classifier training. 'sessions': legacy multi-turn continuous recordings.",
-    )
-
-    # windows mode
     parser.add_argument("--window-duration-s", type=float, default=3.0)
     parser.add_argument("--min-segment-s", type=float, default=1.0)
     parser.add_argument("--change-position-step-s", type=float, default=0.5)
@@ -588,32 +669,25 @@ if __name__ == "__main__":
     parser.add_argument("--change-fraction", type=float, default=0.5)
     parser.add_argument("--num-pairs", type=int, default=300)
 
-    # sessions mode (legacy)
-    parser.add_argument("--count", type=int, default=4)
+    parser.add_argument(
+    "--num-workers", 
+    type=int, 
+    default=None, 
+    help="Number of parallel processes to use. Defaults to CPU core count."
+    )
 
     args = parser.parse_args()
     clips_db = load_speaker_clips(args.data_dir)
-
-    if args.mode == "windows":
-        generate_window_dataset(
-            clips_db,
-            output_dir=args.output_dir,
-            window_duration_s=args.window_duration_s,
-            min_segment_s=args.min_segment_s,
-            change_position_step_s=args.change_position_step_s,
-            change_position_jitter_s=args.change_position_jitter_s,
-            change_fraction=args.change_fraction,
-            num_pairs=args.num_pairs,
-            frame_hop_ms=args.frame_hop_ms,
-            label_tolerance_ms=args.label_tolerance_ms,
-            seed=args.seed,
-        )
-    else:
-        generate_and_save_suite(
-            clips_db,
-            output_dir=args.output_dir,
-            count=args.count,
-            seed=args.seed,
-            frame_hop_ms=args.frame_hop_ms,
-            label_tolerance_ms=args.label_tolerance_ms,
-        )
+    generate_window_dataset(
+        clips_db,
+        output_dir=args.output_dir,
+        window_duration_s=args.window_duration_s,
+        min_segment_s=args.min_segment_s,
+        change_position_step_s=args.change_position_step_s,
+        change_position_jitter_s=args.change_position_jitter_s,
+        change_fraction=args.change_fraction,
+        num_pairs=args.num_pairs,
+        frame_hop_ms=args.frame_hop_ms,
+        label_tolerance_ms=args.label_tolerance_ms,
+        seed=args.seed,
+    )
