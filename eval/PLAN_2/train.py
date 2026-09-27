@@ -64,8 +64,10 @@ def train_model(
         kernel_size=kernel_size,
     ).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    criterion = torch.nn.BCEWithLogitsLoss(
+        # pos_weight=pos_weight, reduction="none"
+        )
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
 
     # prior_prob = pos / (pos + neg)
