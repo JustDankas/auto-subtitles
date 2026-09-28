@@ -45,21 +45,6 @@ class AudioFeatureExtractorGPU(nn.Module):
         std = feats.std(dim=1, keepdim=True) + 1e-5
         return (feats - mean) / std
 
-class CausalConv1dBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation=1, dropout=0.15):
-        super().__init__()
-        self.pad = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
-        self.norm = nn.BatchNorm1d(out_ch)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-
-
-    def forward(self, x):  # x: (B, C, T)
-        x = nn.functional.pad(x, (self.pad, 0))  # left-pad only -> causal
-        return self.dropout(self.act(self.norm(self.conv(x))))
-
-
 def cnn_receptive_field(num_layers: int, kernel_size: int, dilation_base: int = 2) -> int:
     """Receptive field, in frames, of a stack of `num_layers` causal conv
     blocks with kernel_size `kernel_size` and dilation doubling each layer
@@ -79,6 +64,17 @@ def required_cnn_layers(window_frames: int, kernel_size: int, dilation_base: int
         n += 1
     return n
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation=1, dropout=0.15, causal=False):
+        super().__init__()
+        total = (kernel_size - 1) * dilation
+        self.pad = (total, 0) if causal else (total // 2, total - total // 2)   # symmetric = non-causal
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
+        self.norm, self.act, self.dropout = nn.BatchNorm1d(out_ch), nn.ReLU(), nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = nn.functional.pad(x, self.pad)
+        return self.dropout(self.act(self.norm(self.conv(x))))
 
 class SCDModel(nn.Module):
     """
@@ -132,7 +128,7 @@ class SCDModel(nn.Module):
             layers, in_ch = [], input_dim
             for i in range(num_layers):
                 layers.append(
-                    CausalConv1dBlock(in_ch, hidden_dim, kernel_size=kernel_size, dilation=2**i)
+                    ConvBlock(in_ch, hidden_dim, kernel_size=kernel_size, dilation=2**i)
                 )
                 in_ch = hidden_dim
             self.backbone = nn.Sequential(*layers)
@@ -145,9 +141,9 @@ class SCDModel(nn.Module):
             rnn_cls = nn.GRU if backbone == "gru" else nn.LSTM
             # unidirectional == causal; bidirectional would leak future context
             self.backbone = rnn_cls(
-                input_dim, hidden_dim, num_layers, batch_first=True, bidirectional=False
+                input_dim, hidden_dim, num_layers, batch_first=True, bidirectional=True
             )
-            self.head = nn.Linear(hidden_dim, 1)
+            self.head = nn.Linear(2 * hidden_dim, 1)
             self.num_layers = num_layers
             self.receptive_field_frames = None  # unbounded within the fed window
         else:
