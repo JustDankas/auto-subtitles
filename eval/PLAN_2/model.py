@@ -1,6 +1,49 @@
 import torch
 import torch.nn as nn
+import torchaudio.transforms as T
 
+SAMPLE_RATE = 16000
+class GPUSpecAugment(nn.Module):
+    """GPU-accelerated SpecAugment using torchaudio built-ins."""
+    def __init__(self, time_mask_param=10, freq_mask_param=8, p=0.5):
+        super().__init__()
+        self.p = p
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=freq_mask_param)
+        self.time_mask = T.TimeMasking(time_mask_param=time_mask_param)
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        # feats shape expected: (B, n_mels, T)
+        if self.training and (torch.rand(1).item() < self.p):
+            feats = self.freq_mask(feats)
+            feats = self.time_mask(feats)
+        return feats
+
+
+class AudioFeatureExtractorGPU(nn.Module):
+    """Extracts Mel-Spectrogram, applies SpecAugment, and normalizes directly on GPU."""
+    def __init__(self, n_mels=64, augment=False):
+        super().__init__()
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=n_mels
+        )
+        self.augment = GPUSpecAugment() if augment else None
+
+    def forward(self, wavs: torch.Tensor) -> torch.Tensor:
+        # 1. Mel Spectrogram (B, n_mels, T)
+        mel = self.mel_transform(wavs)
+        log_mel = torch.log(mel + 1e-6)
+
+        # 2. SpecAugment (on raw log-mels)
+        if self.augment is not None:
+            log_mel = self.augment(log_mel)
+
+        # 3. Transpose to (B, T, n_mels) for model
+        feats = log_mel.transpose(1, 2)
+
+        # 4. Instance Normalization across time steps T
+        mean = feats.mean(dim=1, keepdim=True)
+        std = feats.std(dim=1, keepdim=True) + 1e-5
+        return (feats - mean) / std
 
 class CausalConv1dBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation=1, dropout=0.15):
@@ -60,8 +103,10 @@ class SCDModel(nn.Module):
         window_duration_s: float = 3.0,
         frame_hop_ms: float = 10.0,
         kernel_size: int = 7,
+        augment: bool = False
     ):
         super().__init__()
+        self.feature_extractor = AudioFeatureExtractorGPU(n_mels=input_dim, augment=augment)
         self.backbone_type = backbone
         self.window_duration_s = window_duration_s
         self.frame_hop_ms = frame_hop_ms
@@ -109,6 +154,10 @@ class SCDModel(nn.Module):
             raise ValueError(f"Unknown backbone: {backbone}")
 
     def forward(self, x):
+        # 1. Convert raw audio batch (B, num_samples) to Log-Mel on GPU
+        x = self.feature_extractor(x)  # Yields (B, T, input_dim)
+
+        # 2. Run Backbone
         if self.backbone_type == "cnn":
             x = self.backbone(x.transpose(1, 2)).transpose(1, 2)  # (B,T,hidden)
         else:
