@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio.transforms as T
 
 SAMPLE_RATE = 16000
@@ -64,98 +65,80 @@ def required_cnn_layers(window_frames: int, kernel_size: int, dilation_base: int
         n += 1
     return n
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation=1, dropout=0.15, causal=False):
+class CausalConv1d(nn.Module):
+    """Conv1d with explicit causal (left) padding."""
+    def __init__(self, in_ch, out_ch, kernel_size, stride=1, dilation=1):
         super().__init__()
-        total = (kernel_size - 1) * dilation
-        self.pad = (total, 0) if causal else (total // 2, total - total // 2)   # symmetric = non-causal
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
-        self.norm, self.act, self.dropout = nn.BatchNorm1d(out_ch), nn.ReLU(), nn.Dropout(dropout)
+        self.left_pad = (kernel_size - 1) * dilation
+        self.stride = stride
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, dilation=dilation)
 
     def forward(self, x):
-        x = nn.functional.pad(x, self.pad)
-        return self.dropout(self.act(self.norm(self.conv(x))))
+        # Pad only on the left (past) side
+        x = F.pad(x, (self.left_pad, 0))
+        return self.conv(x)
 
-class SCDModel(nn.Module):
-    """
-    backbone: "cnn" | "gru" | "lstm"
-    input: (B, T, input_dim) log-mel/MFCC frames
-    output: (B, T) raw logits, one per input frame (apply sigmoid for P(change))
 
-    window_duration_s / frame_hop_ms describe the fixed-length window this
-    model is trained and run on (see synthetic.py's windows mode) -- for the
-    "cnn" backbone they're used to auto-size the network's depth so its
-    receptive field actually covers the whole window; for "gru"/"lstm" they're
-    stored for reference only, since an RNN run once per window with a fresh
-    hidden state already sees the entire window regardless of depth.
-    """
+class ResTCNBlockCausal(nn.Module):
+    """Residual dilated causal block."""
+    def __init__(self, ch, kernel_size=5, dilation=1, dropout=0.15):
+        super().__init__()
+        self.conv1 = CausalConv1d(ch, ch, kernel_size=kernel_size, dilation=dilation)
+        self.bn1 = nn.BatchNorm1d(ch)
+        self.conv2 = nn.Conv1d(ch, ch, kernel_size=1)  # 1x1 conv is inherently causal
+        self.bn2 = nn.BatchNorm1d(ch)
+        self.drop = nn.Dropout(dropout)
 
+    def forward(self, x):
+        y = self.drop(F.gelu(self.bn1(self.conv1(x))))
+        return F.gelu(x + self.bn2(self.conv2(y)))
+
+
+class CausalSCDNet(nn.Module):
+    """Fully Causal, CPU-Optimized Speaker Change Detection Network."""
     def __init__(
         self,
-        input_dim: int = 64,
-        hidden_dim: int = 64,
-        num_layers: int = None,
-        backbone: str = "gru",
-        window_duration_s: float = 3.0,
-        frame_hop_ms: float = 10.0,
-        kernel_size: int = 7,
-        augment: bool = False
+        n_mels: int = 64,
+        ch: int = 64,
+        kernel_size: int = 5,
+        dilations: tuple = (1, 2, 4, 8),
+        dropout: float = 0.15,
+        augment: bool = False,
+        n_outputs: int = 2,
     ):
         super().__init__()
-        self.feature_extractor = AudioFeatureExtractorGPU(n_mels=input_dim, augment=augment)
-        self.backbone_type = backbone
-        self.window_duration_s = window_duration_s
-        self.frame_hop_ms = frame_hop_ms
-        self.window_frames = int(round(window_duration_s * 1000.0 / frame_hop_ms))
+        self.frontend = AudioFeatureExtractorGPU(n_mels=n_mels, augment=augment)
+        
+        # Causal downsampling stem (10ms -> 40ms frame resolution)
+        self.stem = nn.Sequential(
+            CausalConv1d(n_mels, ch, kernel_size=5, stride=2),
+            nn.BatchNorm1d(ch),
+            nn.GELU(),
+            CausalConv1d(ch, ch, kernel_size=5, stride=2),
+            nn.BatchNorm1d(ch),
+            nn.GELU(),
+        )
+        
+        # Causal Residual TCN backbone
+        self.blocks = nn.Sequential(
+            *[ResTCNBlockCausal(ch, kernel_size, d, dropout) for d in dilations]
+        )
+        self.head = nn.Conv1d(ch, n_outputs, 1)
 
-        if backbone == "cnn":
-            if num_layers is None:
-                num_layers = required_cnn_layers(self.window_frames, kernel_size)
-                print(
-                    f"[SCDModel] auto-selected {num_layers} CNN layers (kernel_size="
-                    f"{kernel_size}) to cover a {window_duration_s}s ({self.window_frames}"
-                    f"-frame) window"
-                )
-            rf = cnn_receptive_field(num_layers, kernel_size)
-            if rf < self.window_frames:
-                print(
-                    f"[SCDModel] WARNING: receptive field is {rf} frames but the window "
-                    f"is {self.window_frames} frames -- this model cannot see the start "
-                    "of the window when judging its end. Increase num_layers or "
-                    "kernel_size, or leave num_layers unset to auto-size it."
-                )
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for b in self.blocks:
+            nn.init.zeros_(b.bn2.weight)
 
-            layers, in_ch = [], input_dim
-            for i in range(num_layers):
-                layers.append(
-                    ConvBlock(in_ch, hidden_dim, kernel_size=kernel_size, dilation=2**i)
-                )
-                in_ch = hidden_dim
-            self.backbone = nn.Sequential(*layers)
-            self.head = nn.Linear(hidden_dim, 1)
-            self.num_layers = num_layers
-            self.receptive_field_frames = rf
-
-        elif backbone in ("gru", "lstm"):
-            num_layers = num_layers or 2
-            rnn_cls = nn.GRU if backbone == "gru" else nn.LSTM
-            # unidirectional == causal; bidirectional would leak future context
-            self.backbone = rnn_cls(
-                input_dim, hidden_dim, num_layers, batch_first=True, bidirectional=True
-            )
-            self.head = nn.Linear(2 * hidden_dim, 1)
-            self.num_layers = num_layers
-            self.receptive_field_frames = None  # unbounded within the fed window
-        else:
-            raise ValueError(f"Unknown backbone: {backbone}")
-
-    def forward(self, x):
-        # 1. Convert raw audio batch (B, num_samples) to Log-Mel on GPU
-        x = self.feature_extractor(x)  # Yields (B, T, input_dim)
-
-        # 2. Run Backbone
-        if self.backbone_type == "cnn":
-            x = self.backbone(x.transpose(1, 2)).transpose(1, 2)  # (B,T,hidden)
-        else:
-            x, _ = self.backbone(x)
-        return self.head(x).squeeze(-1)  # (B, T)
+    def forward(self, wav):
+        x = self.frontend(wav).transpose(1, 2)  # (B, n_mels, T_in)
+        T_in = x.shape[-1]
+        
+        out = self.head(self.blocks(self.stem(x)))  # Downsampled sequence (B, n_outputs, T_down)
+        
+        # Causal upsampling using nearest neighbor (repeats last valid state into future frame grid)
+        return F.interpolate(out, size=T_in, mode="nearest")
