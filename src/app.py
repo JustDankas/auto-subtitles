@@ -10,8 +10,9 @@ Two top-level windows moved together:
     for this pass).
 
 Usage:
-    python 06_subtitle_overlay_app.py --asr-model-dir sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model silero_vad.onnx --provider cpu --log-file transcript.jsonl
-    python 06_subtitle_overlay_app.py --asr-model-dir ... --click-through   (test click-through mode)
+    python app.py --asr-model-dir sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model silero_vad.onnx --provider cpu --log-file transcript.jsonl
+    python app.py --scd-checkpoint models\\scd.pt          (enable speaker-change line splits)
+    python app.py --asr-model-dir ... --click-through       (test click-through mode)
 """
 
 import argparse
@@ -38,16 +39,21 @@ def main() -> None:
     parser.add_argument("--vad-threshold", type=float, default=0.2)
     parser.add_argument("--min-silence", type=float, default=0.5, help="Seconds of silence to consider a line ended (default: 0.5)")
     parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
-    parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 20.0)")
+    parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 12.0)")
     parser.add_argument("--overlap-seconds", type=float, default=1.0, help="Seconds of audio overlap to feed into the next line when rule3 is triggered (default: 1.0)")
-    # Speaker detection options
-    parser.add_argument("--speaker-model", type=str, default=None, help="Path to wespeaker/CAM++ ONNX model. Leave this blank to disable speaker detection.")
-    parser.add_argument("--speaker-k", type=float, default=2.5, help="Z-score change detection threshold")
-    parser.add_argument("--std-floor", type=float, default=0.05, help="Minimum standard deviation floor")
-    parser.add_argument("--speaker-min-window", type=int, default=3, help="Min window before detection begins")
-    parser.add_argument("--speaker-max-window", type=int, default=20, help="Max history window size")
-    parser.add_argument("--speaker-split-backdate-seconds", type=float, default=0.7, help="Backdate for speaker change detection (default: 0.4)")
-    parser.add_argument("--speaker-split-mode", type=str, default="wallclock", choices=["wallclock", "token"], help="Speaker change detection mode (default: wallclock)")
+    # Speaker change detection (SCDNet) options
+    parser.add_argument("--scd-checkpoint", type=str, default=None, help="Path to the SCDNet checkpoint (.pt). Leave empty to disable speaker-change line splitting.")
+    parser.add_argument("--scd-threshold", type=float, default=0.6, help="Smoothed change probability needed to fire (default: 0.6; tune at stream level, expect it to need to be higher than the training-optimal value)")
+    parser.add_argument("--scd-hop", type=float, default=0.25, help="Seconds of new audio between SCD inferences (default: 0.25)")
+    parser.add_argument("--scd-left-guard", type=float, default=0.5, help="Ignore peaks in the first N seconds of each 3 s window. The model never saw changes closer than 0.5 s to an edge (default: 0.5)")
+    parser.add_argument("--scd-right-guard", type=float, default=1.0, help="Ignore peaks in the last N seconds of the window; also ~the detection latency (default: 1.0)")
+    parser.add_argument("--scd-min-gap", type=float, default=1.0, help="Minimum seconds between two reported changes (default: 1.0)")
+    parser.add_argument("--scd-reset-gap", type=float, default=1.5, help="Seconds of non-speech after which the SCD audio window is cleared (default: 1.5)")
+    parser.add_argument("--scd-settle", type=float, default=0.1, help="Extra seconds to wait after asr-decode-lag before splitting a line (default: 0.1)")
+    parser.add_argument("--scd-device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device for SCD inference, independent of --provider (default: cpu)")
+    parser.add_argument("--scd-threads", type=int, default=1, help="Torch CPU threads for SCD inference (default: 1)")
+    parser.add_argument("--scd-debug-dump", type=str, default=None, help="Append per-window smoothed probabilities to this .jsonl file for offline retuning")
+    parser.add_argument("--asr-decode-lag", type=float, default=0.8, help="Seconds between a word being spoken and appearing in the ASR partial result (default: 0.8; calibrate per plan Phase 1b)")
     # Number formatting options
     parser.add_argument(
         "--numbers",
@@ -119,11 +125,18 @@ def main() -> None:
         vad_model_path=args.vad_model,
         asr_model_dir=args.asr_model_dir,
         log_file=args.log_file,
-        speaker_model_path=args.speaker_model,
-        speaker_k=args.speaker_k,
-        speaker_min_window=args.speaker_min_window,
-        std_floor=args.std_floor,
-        max_window=args.speaker_max_window,
+        scd_checkpoint=args.scd_checkpoint,
+        scd_device=args.scd_device,
+        scd_threads=args.scd_threads,
+        scd_threshold=args.scd_threshold,
+        scd_hop=args.scd_hop,
+        scd_left_guard=args.scd_left_guard,
+        scd_right_guard=args.scd_right_guard,
+        scd_min_gap=args.scd_min_gap,
+        scd_reset_gap=args.scd_reset_gap,
+        scd_settle=args.scd_settle,
+        scd_debug_dump=args.scd_debug_dump,
+        asr_decode_lag=args.asr_decode_lag,
         provider=args.provider,
         int8=args.int8,
         vad_threshold=args.vad_threshold,
@@ -134,8 +147,6 @@ def main() -> None:
         number_threshold=args.number_threshold,
         num_threads=args.num_threads,
         overlap_seconds=args.overlap_seconds,
-        speaker_split_backdate_seconds=args.speaker_split_backdate_seconds,
-        speaker_split_mode=args.speaker_split_mode,
     )
 
     worker.partial_updated.connect(overlay.update_partial)
