@@ -1,14 +1,4 @@
 """
-Phase 7: split-window overlay.
-
-Two top-level windows moved together:
-  - DragHandle: small always-on-top, always-interactive bar with a grip and
-    the close button. This is how you drag and how you exit, always.
-  - SubtitleOverlay: the caption box below it, showing per-line fading/
-    shrinking boxes. Optionally click-through via --click-through (a real
-    toggle button in the GUI itself is a natural next step, out of scope
-    for this pass).
-
 Usage:
     python app.py --asr-model-dir sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model silero_vad.onnx --provider cpu --log-file transcript.jsonl
     python app.py --scd-checkpoint models\\scd.pt          (enable speaker-change line splits)
