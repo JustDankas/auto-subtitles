@@ -2,28 +2,6 @@
 Runs capture -> VAD gate -> (speaker-change detector) + incremental
 streaming ASR -> logging on a background QThread, emitting throttled
 partial updates and immediate finalized-line signals for the GUI.
-
-Three behaviors worth calling out:
-
-1. PRE-ROLL BUFFER: the VAD needs a brief window of confirmed speech before
-   is_speech_active() flips True, which would otherwise clip the first
-   word each time someone starts talking. We keep a short rolling buffer of
-   recent (not-yet-classified-as-speech) audio and replay it into the ASR
-   stream the moment speech is confirmed.
-
-2. THROTTLED PARTIALS: partial text can change many times per second as
-   the model decodes; we only emit new_partial_text when the text has
-   actually changed AND at most ~4 times/sec, so the GUI redraws calmly
-   instead of flickering.
-
-3. SPEAKER-CHANGE LINE SPLITS (SCDNet): the same gated audio goes to the
-   StreamingSpeakerChangeDetector and to the ASR. The detector reports a
-   change time on its AUDIO CLOCK (gated samples pushed / 16000). Because
-   Nemotron gives no token timestamps, we stamp (clock, word_count) every
-   time the partial word count changes, and later split the open utterance
-   at count_at(t_change + asr_decode_lag): "the words that had appeared by
-   the time the ASR could have decoded everything said before the change".
-   The split is UI/log-only; the ASR stream is never touched.
 """
 
 import collections
@@ -32,11 +10,11 @@ from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
-from scd_detector import StreamingSpeakerChangeDetector, TorchBackend
 
 from asr_engine import StreamingAsrEngine
 from audio_capture import TARGET_RATE, LoopbackAudioCapture
 from ring_buffer import AudioRingBuffer
+from scd_detector import StreamingSpeakerChangeDetector, TorchBackend
 from text_formatter import format_line
 from transcript_logger import TranscriptLogger
 from vad_gate import SpeechGate

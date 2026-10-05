@@ -1,13 +1,5 @@
 """
 Continuous WASAPI loopback capture -> 16kHz mono float32 -> AudioRingBuffer.
-
-Runs via a PortAudio stream callback (not a blocking read loop), so capture
-happens on PortAudio's own high-priority thread with minimal added latency.
-The callback must be fast and must never block, so:
-  - downmix + resample happen inline (cheap, pure numpy/audioop)
-  - the ring buffer write is a quick lock/copy, not I/O
-
-This is the class that Phase 4+ will import directly into the final app.
 """
 
 import audioop

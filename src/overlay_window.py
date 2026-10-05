@@ -3,28 +3,18 @@ The caption display window.
 
 Each line is its own small rounded-rect box. Qt schedules the fade and height
 animations directly, so the overlay does not need a polling timer.
-
-No drag/close logic here anymore - that moved to drag_handle.py (see its
-docstring for why). This window can optionally be click-through
-(WA_TransparentForMouseEvents), controlled by main_app.py.
-
-CLICK-THROUGH CAVEAT: `Qt.WindowType.WindowTransparentForInput` is the
-flag Qt provides for OS-level input transparency; I have not been able to
-verify it behaves correctly on Windows in this exact PyQt6 version. If
---click-through doesn't actually let clicks pass through to whatever's
-behind the captions, tell me what you observe (nothing happens / errors /
-window disappears / etc.) and we'll adjust.
 """
 
 import logging
 import time
 from typing import List, Optional
 
-from line_splitter import split_into_chunks
 from PyQt6.QtCore import QPropertyAnimation, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PyQt6.QtWidgets import (QGraphicsOpacityEffect, QLabel, QVBoxLayout,
                              QWidget)
+
+from line_splitter import split_into_chunks
 
 MAX_LINES = 2
 MAX_RENDERED_LINES = 2

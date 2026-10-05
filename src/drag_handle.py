@@ -1,13 +1,5 @@
 """
 Small, always-on-top, always-interactive drag handle + close button.
-
-Kept as a SEPARATE top-level window from the caption box, because true
-OS-level click-through (mouse events passing through to whatever's behind
-the captions - e.g. a video player) requires the WHOLE native window to be
-click-through on Windows; there's no way to make only part of one window
-click-through. So: two windows, moved together by main_app.py via the
-`moved` signal. This handle is never click-through, regardless of the
-caption box's setting - it's always how you drag and always how you close.
 """
 
 from typing import Optional

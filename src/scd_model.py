@@ -1,12 +1,6 @@
 """
 model.py -- non-causal, residual, downsampled TCN for fixed-window speaker-change detection.
 
-Replaces the causal SCDModel. The window is handed to the model whole, once per
-call, so "non-causal" here means "two-sided within the window" -- every frame
-can use audio from both before and after it *inside* the 3 s clip. That is the
-fix for the recall ceiling diagnosed in scd_plateau_plan.md: a strictly causal
-net cannot fire on a centered label before it has heard the new speaker.
-
 Output has 2 channels: channel 0 is the change-bump target (what you train/
 threshold on), channel 1 is an auxiliary "which side of the change am I on"
 step target (0 before t_change, 1 after) that supervises every frame instead

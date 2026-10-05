@@ -7,11 +7,6 @@ VAD/ASR thread) periodically drain it. If a consumer falls behind for longer
 than `max_seconds`, the OLDEST audio is overwritten and we count it as
 "dropped" rather than growing memory unboundedly or blocking the audio
 callback (blocking the audio thread causes audible glitches/underruns).
-
-For a real-time subtitle app, a few seconds of ring buffer is plenty -
-if the consumer is more than a few seconds behind, something downstream is
-too slow and we want to know that (via `stats`), not silently buffer minutes
-of audio.
 """
 
 import threading

@@ -1,8 +1,9 @@
 """
 Usage:
-    python app.py --asr-model-dir sherpa-onnx-streaming-zipformer-en-2023-06-21 --vad-model silero_vad.onnx --provider cpu --log-file transcript.jsonl
-    python app.py --scd-checkpoint models\\scd.pt          (enable speaker-change line splits)
-    python app.py --asr-model-dir ... --click-through       (test click-through mode)
+python src/app.py --scd-checkpoint models\scdnet_tcn_20261005_best.pt --scd-device cpu --scd-threshold 0.3
+
+python src/app.py --click-through
+
 """
 
 import argparse

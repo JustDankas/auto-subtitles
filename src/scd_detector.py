@@ -14,10 +14,6 @@ Key ideas (see SCD_CONVERT_PLAN_v2.md, sections 4.2 and 4.3):
   about `right_guard` .. `right_guard + hop` seconds after it happened.
 - Decision rule mirrors eval_utils: sigmoid(channel 0) -> 5-frame uniform
   smoothing (edge replicated) -> threshold -> local peak.
-
-The backend is swappable: anything callable as
-    backend(window: float32[48000]) -> float32[301] of per-frame P(change)
-works (TorchBackend now, an ONNX backend later - plan Phase 8).
 """
 
 import inspect

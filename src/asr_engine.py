@@ -1,20 +1,3 @@
-"""
-True incremental streaming ASR: a persistent OnlineStream fed audio
-continuously while VAD says we're in a speech region. Uses the
-RECOGNIZER'S OWN endpoint detector (not the VAD's segment logic) to decide
-when a line is "done" - this is the fix for the original bug: latency was
-previously bounded by silence duration, so uninterrupted speech (a lecture,
-a call with no pauses) could run indefinitely before anything appeared.
-rule3_min_utterance_length forces a line break after N seconds of
-continuous speech even with zero pauses.
-
-This exact is_ready/decode_stream/get_result/is_endpoint/reset pattern is
-the one already validated working in your Phase 0 test (the CPU RTF=0.158
-run) - only the rule1/rule2/rule3 endpoint-tuning kwargs below are new and
-unverified against your installed version. If construction throws a
-TypeError about an unexpected keyword, tell me the exact message and I'll
-adjust the parameter names.
-"""
 
 import json
 from dataclasses import dataclass
