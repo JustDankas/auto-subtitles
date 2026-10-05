@@ -1,0 +1,3 @@
+{
+  "weights_path": "SCD/checkpoints/scdnet_20261005_011521_blocks5_k5_causalFalse_denseTrue.pt"
+}
