@@ -3,4 +3,6 @@ sherpa-onnx
 PyAudioWPatch
 PyQt6
 text2num
+torch
+torchaudio
 audioop-lts; python_version >= "3.13"

@@ -18,7 +18,7 @@ All recognition happens on your machine. No audio leaves it.
 - Captures system audio through WASAPI loopback, so it works with any player or app, with no plugins.
 - Streaming recognition with a Nemotron transducer from [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Text appears while people are still speaking.
 - Silero voice activity detection keeps silence and most music away from the recognizer.
-- Optional speaker-change detection uses WeSpeaker CAM++ embeddings and z-score scoring to split caption lines when the speaker changes. It detects changes, but does not identify speakers by name.
+- Optional speaker-change detection uses a PyTorch SCDNet checkpoint to split caption lines when the speaker changes. It detects changes, but does not identify speakers by name.
 - Translucent, draggable, always-on-top caption window. Each line fades out after a few seconds.
 - Optional click-through mode (experimental) so clicks reach the app behind the captions.
 - Per-line JSONL log with timestamp, text, confidence, and duration. The logger flushes after each line, so a crash does not lose finished lines.
@@ -67,19 +67,18 @@ Conda-forge ships Qt with its own compatible runtime libraries, which fixes the 
 ```powershell
 conda create -n stream-asr -c conda-forge python=3.12 numpy pyqt6
 conda activate stream-asr
-pip install sherpa-onnx PyAudioWPatch
+pip install sherpa-onnx PyAudioWPatch torch torchaudio
 ```
 
 Then continue with step 3. Activate the environment with `conda activate stream-asr` each time you open a new terminal.
 
 **3. Download the models**
 
-The app needs a streaming Nemotron speech recognition model, the Silero VAD model (under 1 MB), and the WeSpeaker CAM++ speaker recognition model. All models come from the sherpa-onnx release page.
+The app needs a streaming Nemotron speech recognition model and the Silero VAD model (under 1 MB). If you want speaker-change line splitting, also provide a trained SCDNet PyTorch checkpoint (`.pt` file).
 
 ```powershell
 mkdir models
 curl.exe -L -o models\silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-curl.exe -L -o models\wespeaker_en_voxceleb_CAM++.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx
 # 1. Download the archive
 curl.exe -L -o models\nemotron.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2
 
@@ -93,7 +92,7 @@ tar -xjf models\nemotron.tar.bz2 -C models\nemotron-en-0.6b-560ms-int8-2026-04-2
 Remove-Item models\nemotron.tar.bz2
 ```
 
-After extraction, the extracted `models\nemotron-en-0.6b-560ms-int8-2026-04-25` directory contains `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, and `tokens.txt`. The speaker model is saved as `models\wespeaker_en_voxceleb_CAM++.onnx`.
+After extraction, the `models\nemotron-en-0.6b-560ms-int8-2026-04-25` directory contains `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, and `tokens.txt`. SCD is disabled unless you pass a trained checkpoint with `--scd-checkpoint`.
 
 ## Run
 
@@ -109,7 +108,7 @@ More examples:
 
 ```powershell
 # Speaker-change detection with suggested hyperparameters
-python src/app.py --int8 --speaker-model models\wespeaker_en_voxceleb_CAM++.onnx --speaker-k 1.5 --std-floor 0.125 --speaker-min-window 2 --speaker-max-window 15 --num-threads 4 --speaker-split-backdate-seconds 0.7 --speaker-split-mode token
+python src/app.py --scd-checkpoint models\scdnet_tcn_20261005_best.pt --scd-device cpu --scd-threshold 0.5
 
 # Raise the VAD threshold to reject background music, and write to a custom log file
 python src/app.py --vad-threshold 0.5 --log-file lecture.jsonl
@@ -131,13 +130,18 @@ python src/app.py --click-through --new-text-color 00C3FF
 | `--min-silence`                    | `0.5`              | Seconds of silence before the VAD closes a speech region.                            |
 | `--rule2-silence`                  | `0.5`              | Seconds of trailing silence that end a caption line.                                 |
 | `--rule3-utterance`                | `12.0`             | Seconds of continuous speech after which a line break is forced.                     |
-| `--speaker-model`                  | off                | Path to the WeSpeaker/CAM++ ONNX model. Enables speaker-change detection.            |
-| `--speaker-k`                      | `1.5`              | Z-score threshold for declaring an embedding change.                                 |
-| `--std-floor`                      | `0.125`            | Minimum similarity standard deviation used by the detector.                          |
-| `--speaker-min-window`             | `2`                | Embeddings collected before change detection begins.                                 |
-| `--speaker-max-window`             | `15`               | Maximum number of recent embeddings kept for comparison.                             |
-| `--speaker-split-backdate-seconds` | `0.7`              | Backdate used to keep unsettled boundary words with the next line.                   |
-| `--speaker-split-mode`             | `token`            | `token` uses ASR timestamps; `wallclock` uses a wall-clock approximation.            |
+| `--scd-checkpoint`                 | off                | Path to a trained SCDNet PyTorch checkpoint (`.pt`). Enables speaker-change splits.  |
+| `--scd-threshold`                  | `0.5`              | Smoothed change probability required to report a change.                             |
+| `--scd-hop`                        | `0.25`             | Seconds of new speech audio between SCD inference windows.                           |
+| `--scd-left-guard`                 | `0.5`              | Ignore candidate changes this close to the start of each 3-second window.            |
+| `--scd-right-guard`                | `1.0`              | Ignore candidate changes this close to the end of each window.                       |
+| `--scd-min-gap`                    | `1.0`              | Minimum seconds between reported changes.                                            |
+| `--scd-reset-gap`                  | `1.5`              | Clear the SCD audio window after this much non-speech.                               |
+| `--scd-settle`                     | `0.1`              | Extra wait after the ASR decode lag before splitting a line.                          |
+| `--scd-device`                     | `cpu`              | PyTorch device for SCD inference (`cpu` or `cuda`), independent of `--provider`.      |
+| `--scd-threads`                    | `1`                | Number of CPU threads used by SCD inference.                                         |
+| `--scd-debug-dump`                 | off                | Append per-window probabilities to this JSONL path for offline tuning.                |
+| `--asr-decode-lag`                 | `0.8`              | Estimated seconds from spoken word to ASR partial; used to align SCD splits.          |
 | `--new-text-color`                 | `#FFFF00`          | Color of the line currently being recognized.                                        |
 | `--old-text-color`                 | `#E5E5E5`          | Color of finished lines.                                                             |
 | `--width`, `--height`              | `900`, `160`       | Caption window size in pixels.                                                       |
@@ -176,17 +180,16 @@ SpeechGate              Silero VAD (sherpa-onnx, CPU), 512-sample windows
         |-- no speech --> 0.3 s pre-roll buffer
         |
         |-- speech -----> StreamingAsrEngine    Nemotron transducer, greedy search, endpoint detection
-                                |
-                                |-- same speech audio --> SpeakerEmbeddingService (optional CAM++)
-                                |                              |
-                                |                              v
-                                |                      InstantChangeDetector
-                                |                      z-score over recent embeddings
-                                |                              |
-                                |                  speaker change --> UI/log line split
-                                |
-                                |-- partial text, throttled to 4 updates/s --> overlay (current line)
-                                |-- finalized line --> text_formatter --> overlay + TranscriptLogger (JSONL)
+        |                      |
+        |                      |-- partial text, throttled to 4 updates/s --> overlay (current line)
+        |                      |-- finalized line --> text_formatter --> overlay + TranscriptLogger (JSONL)
+        |
+        |-- same speech audio --> StreamingSpeakerChangeDetector (optional PyTorch SCDNet)
+                                       |
+                                       | 3 s windows, evaluated every 0.25 s
+                                       | smoothed change probabilities + peak selection
+                                       v
+                                speaker change --> UI/log line split (ASR stream unchanged)
 ```
 
 Three threads run at once. PortAudio's callback thread captures audio. A `QThread` (`PipelineWorker`) runs the VAD, the recognizer, and the logger. The Qt main thread draws the overlay. The worker talks to the GUI through Qt signals and does not touch widgets directly.
@@ -199,8 +202,9 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 | `ring_buffer.py`       | Thread-safe circular buffer with dropped-audio counters.                                              |
 | `vad_gate.py`          | Wraps sherpa-onnx's Silero VAD and buffers arbitrary-length input into exact 512-sample windows.      |
 | `asr_engine.py`        | Persistent `OnlineStream` with endpoint detection and a confidence estimate.                          |
-| `pipeline_worker.py`   | The `QThread` that connects capture, VAD, ASR, and logging, and emits GUI signals.                    |
-| `speaker_detector.py`  | Accumulates speech for CAM++ embeddings and detects changes with a rolling cosine-similarity z-score. |
+| `pipeline_worker.py`   | The `QThread` that connects capture, VAD, ASR, optional SCD, and logging, and emits GUI signals.        |
+| `scd_detector.py`      | Runs sliding-window SCD inference and converts model probabilities into audio-clock change events.     |
+| `scd_model.py`         | PyTorch SCDNet model and log-mel feature extraction used by the detector.                                |
 | `text_formatter.py`    | Number formatter that handles years, fractions, thousands.                                            |
 | `transcript_logger.py` | Console and JSONL logging, flushed per line.                                                          |
 | `overlay_window.py`    | Caption window with per-line boxes that fade and shrink.                                              |
@@ -221,9 +225,7 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 
 **The overlay uses two windows.** On Windows, click-through applies to a whole native window, so one window cannot be half click-through. The caption box can be click-through while the small drag handle stays interactive, which lets you move or close the app at any time.
 
-**Speaker changes split the display without resetting ASR.** When `--speaker-model` is enabled, the worker feeds the same VAD-approved speech audio to the CAM++ embedding extractor. `InstantChangeDetector` compares each normalized embedding with a rolling window of recent embeddings. When the similarity z-score exceeds `--speaker-k`, the current caption line is finalized for display and logging, but the recognizer stream, endpoint detector, and audio overlap history continue uninterrupted. This avoids dropping words at a speaker boundary.
-
-The split point is backdated by `--speaker-split-backdate-seconds` so unsettled decoder output and audio from the incoming speaker are not attached to the previous line. In `token` mode, the worker uses the recognizer's per-token timestamps and per-word confidence when available. If the installed sherpa-onnx build does not expose usable token data, it automatically falls back to the `wallclock` approximation. Speaker changes do not add speaker labels to the JSONL output.
+**SCDNet splits the display without resetting ASR.** When `--scd-checkpoint` is set, the worker feeds the same VAD-approved speech audio to a PyTorch SCDNet model in overlapping 3-second windows. Smoothed per-frame change probabilities are thresholded and peak-selected; detected changes are mapped onto the audio clock and aligned with ASR partial word counts using `--asr-decode-lag`. A split finalizes the current display/log line, but leaves the recognizer stream and endpoint detector untouched. SCD detects changes, not speaker identities, so no speaker labels are added to the JSONL output.
 
 ## Tuning
 
@@ -234,9 +236,9 @@ The split point is backdated by `--speaker-split-backdate-seconds` so unsettled 
 | Captions lag behind the speaker               | Lower `--rule2-silence` and `--rule3-utterance`.                                                                 |
 | Sentences split in the middle                 | Raise `--rule2-silence` and `--min-silence`.                                                                     |
 | CPU usage is high                             | Add `--int8`.                                                                                                    |
-| Speaker changes are missed                    | Lower `--speaker-k`, lower `--std-floor`, or increase `--speaker-max-window`.                                    |
-| Speaker lines split too often                 | Raise `--speaker-k` or `--std-floor`; increase `--speaker-min-window`.                                           |
-| Speaker split boundaries feel early or late   | Adjust `--speaker-split-backdate-seconds`; use `--speaker-split-mode token` when token timestamps are available. |
+| Speaker changes are missed                    | Lower `--scd-threshold`; check that a checkpoint is supplied with `--scd-checkpoint`.                            |
+| Speaker lines split too often                 | Raise `--scd-threshold` or `--scd-min-gap`.                                                                      |
+| Speaker split boundaries feel early or late   | Tune `--scd-right-guard` and `--asr-decode-lag`; both affect the alignment/latency tradeoff.                      |
 
 ## Troubleshooting
 
@@ -261,9 +263,9 @@ This mode uses `Qt.WindowType.WindowTransparentForInput`, and I have not verifie
 **`--provider cuda` fails**
 The CUDA path is untested. I could not get it working on a GTX 1070, and CPU inference was fast enough that I stopped pursuing it.
 
-**Speaker detection falls back from token mode**
+**Speaker-change detection does not start**
 
-The `token` mode requires a sherpa-onnx build that exposes per-token timestamps in the recognizer result, and a tokenizer whose word-boundary markers can be reconstructed reliably. When those conditions are not met, the app prints a notice and uses the wall-clock backdate automatically. This affects split precision, not ASR recognition.
+SCD is disabled by default. Pass `--scd-checkpoint` with a compatible trained SCDNet `.pt` checkpoint. PyTorch loads the checkpoint on the selected `--scd-device` (`cpu` by default).
 
 ## Limitations
 
@@ -285,6 +287,7 @@ The `token` mode requires a sherpa-onnx build that exposes per-token timestamps 
 ## Built with
 
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) for streaming ASR and VAD inference
+- [PyTorch](https://pytorch.org/) and torchaudio for SCDNet speaker-change inference and audio features
 - [Silero VAD](https://github.com/snakers4/silero-vad) for voice activity detection
 - [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI loopback capture
 - [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) for the overlay
