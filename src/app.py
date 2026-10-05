@@ -39,11 +39,11 @@ def main() -> None:
     parser.add_argument("--vad-threshold", type=float, default=0.2)
     parser.add_argument("--min-silence", type=float, default=0.5, help="Seconds of silence to consider a line ended (default: 0.5)")
     parser.add_argument("--rule2-silence", type=float, default=1.2, help="Seconds of trailing silence before finalizing (default: 1.2)")
-    parser.add_argument("--rule3-utterance", type=float, default=12.0, help="Seconds of continuous speech before force-finalizing (default: 12.0)")
+    parser.add_argument("--rule3-utterance", type=float, default=20.0, help="Seconds of continuous speech before force-finalizing (default: 12.0)")
     parser.add_argument("--overlap-seconds", type=float, default=1.0, help="Seconds of audio overlap to feed into the next line when rule3 is triggered (default: 1.0)")
     # Speaker change detection (SCDNet) options
     parser.add_argument("--scd-checkpoint", type=str, default=None, help="Path to the SCDNet checkpoint (.pt). Leave empty to disable speaker-change line splitting.")
-    parser.add_argument("--scd-threshold", type=float, default=0.6, help="Smoothed change probability needed to fire (default: 0.6; tune at stream level, expect it to need to be higher than the training-optimal value)")
+    parser.add_argument("--scd-threshold", type=float, default=0.5, help="Smoothed change probability needed to fire (default: 0.6; tune at stream level, expect it to need to be higher than the training-optimal value)")
     parser.add_argument("--scd-hop", type=float, default=0.25, help="Seconds of new audio between SCD inferences (default: 0.25)")
     parser.add_argument("--scd-left-guard", type=float, default=0.5, help="Ignore peaks in the first N seconds of each 3 s window. The model never saw changes closer than 0.5 s to an edge (default: 0.5)")
     parser.add_argument("--scd-right-guard", type=float, default=1.0, help="Ignore peaks in the last N seconds of the window; also ~the detection latency (default: 1.0)")

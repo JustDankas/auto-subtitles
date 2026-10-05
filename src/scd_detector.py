@@ -44,6 +44,7 @@ class TorchBackend:
 
     def __init__(self, checkpoint: str, device: str = "cpu", num_threads: int = 1):
         import torch
+
         from scd_model import SCDNet
 
         torch.set_num_threads(num_threads)
@@ -57,7 +58,7 @@ class TorchBackend:
         cfg["augment"] = False
         sd = {
             k.removeprefix("module.").removeprefix("_orig_mod."): v
-            for k, v in ckpt["model_state_dict"].items()
+            for k, v in ckpt["model"].items()
         }
         model = SCDNet(**cfg)
         model.load_state_dict(sd, strict=True)  # hyperparameter mismatch must fail loudly
