@@ -45,8 +45,8 @@ def boundary_f1(pred_times, true_times, collar_s=0.5):
 
 
 # --- run over the held-out test split ---
-def evaluate(work_dir: str, model, device="cuda"):
-    model.load_state_dict(torch.load(f"{work_dir}/checkpoints/best_gru.pt"))
+def evaluate(work_dir: str, model, device="cuda", checkpoint_path=None):
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.eval()
     manifest = pd.read_csv(f"{work_dir}/data/synth_test/annotations/manifest.csv")
     test_ds = SCDDataset(f"{work_dir}/data/synth_test")

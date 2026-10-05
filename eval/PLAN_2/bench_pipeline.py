@@ -1,5 +1,6 @@
 """
 bench_pipeline.py -- Phase 0 throughput and step-time benchmark tool.
+Updated to support benchmarking with the GPU-accelerated online augmentation pipeline.
 
 Usage:
   python bench_pipeline.py --mode sampler --train_pool_dir ./data/train_pool
@@ -19,9 +20,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gpu_aug import GpuAugmentPipeline
 from model import SCDNet
 from torch.utils.data import DataLoader
-from train import OnTheFlyWindows
+from train import OnTheFlyWindows, raw_collate_fn
 from window_sampler import Pool, SamplerConfig, WindowSampler
 
 try:
@@ -46,14 +48,14 @@ def bench_sampler(train_pool_dir, n_samples=200):
         sampler = WindowSampler(pool, cfg)
         t0 = time.perf_counter()
         for _ in range(n_samples):
-            _ = sampler.sample(rng)
+            _ = sampler.sample(rng, raw=True)
         elapsed = time.perf_counter() - t0
         wps = n_samples / elapsed
-        print(f"  [{name:10s}] {n_samples} windows in {elapsed:.2f}s -> {wps:.2f} windows/s")
+        print(f"  [{name:10s}] {n_samples} raw windows in {elapsed:.2f}s -> {wps:.2f} windows/s")
 
 
 def bench_loader(train_pool_dir, bank_dir, workers_list, batch_size=64, warmup_batches=20, timed_batches=100):
-    print("\n=== Multi-Worker DataLoader Throughput Benchmark ===")
+    print("\n=== Multi-Worker DataLoader Throughput Benchmark (Raw Audio Segments) ===")
     total_samples = (warmup_batches + timed_batches) * batch_size
 
     for num_workers in workers_list:
@@ -66,6 +68,7 @@ def bench_loader(train_pool_dir, bank_dir, workers_list, batch_size=64, warmup_b
             pin_memory=torch.cuda.is_available(),
             persistent_workers=(num_workers > 0),
             prefetch_factor=2 if num_workers > 0 else None,
+            collate_fn=raw_collate_fn,
         )
 
         iterator = iter(dl)
@@ -93,8 +96,8 @@ def bench_loader(train_pool_dir, bank_dir, workers_list, batch_size=64, warmup_b
         print(f"  workers={num_workers:2d} | {timed_batches} batches ({windows_processed} windows) in {elapsed:.2f}s -> {wps:.2f} windows/s | RSS: {rss_str}")
 
 
-def bench_gpu(batch_sizes, n_steps=100):
-    print("\n=== GPU Step Time, Precision & Model Architecture Benchmark ===")
+def bench_gpu(batch_sizes, bank_dir="./data/aug_banks", n_steps=100):
+    print("\n=== GPU Step Time, Precision & Augmentation Pipeline Benchmark ===")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
         print("  CUDA is not available. Skipping GPU benchmark.")
@@ -105,16 +108,23 @@ def bench_gpu(batch_sizes, n_steps=100):
     print(f"  Device: {torch.cuda.get_device_name(0)} (Capability {cap[0]}.{cap[1]})")
     print(f"  Supported Architectures: {arch_list}")
 
+    gpu_aug = GpuAugmentPipeline(bank_dir=bank_dir, split="train", device=device)
+
     # Variations to compare
     model_configs = [
-        ("Depthwise (Non-Causal)", False, False),  # dense=False, causal=False
-        ("Dense (Non-Causal)",     True,  False),  # dense=True,  causal=False
-        ("Depthwise (Causal)",     False, True),   # dense=False, causal=True
-        ("Dense (Causal)",         True,  True),   # dense=True,  causal=True
+        ("Depthwise (Non-Causal)", False, False),
+        ("Dense (Non-Causal)",     True,  False),
+        ("Depthwise (Causal)",     False, True),
+        ("Dense (Causal)",         True,  True),
+    ]
+
+    amp_options = [
+        ("FP32", False),
+        # ("AMP (FP16)", True), # removed since GTX 1070 (sm_61) has no tensor cores. 
     ]
 
     for batch_size in batch_sizes:
-        for mode_name, use_amp in [("FP32", False), ("AMP (FP16)", True)]:
+        for mode_name, use_amp in amp_options:
             for config_label, is_dense, is_causal in model_configs:
                 model = SCDNet(
                     n_mels=64,
@@ -127,17 +137,29 @@ def bench_gpu(batch_sizes, n_steps=100):
                 ).to(device)
 
                 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-                scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+                scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-                # Dummy input matching waveform dimensions: (B, 48000)
-                wav_input = torch.randn(batch_size, 48000, device=device)
+                # Synthetic raw batch matching GPU pipeline expects
+                dummy_raw_batch = {
+                    "seg_a": torch.randn(batch_size, 48000, device=device),
+                    "seg_b": torch.randn(batch_size, 48000, device=device),
+                    "range_a": torch.tensor([[0, 24000]] * batch_size, device=device),
+                    "range_b": torch.tensor([[24000, 48000]] * batch_size, device=device),
+                    "rir_a_id": torch.randint(0, 10, (batch_size,), device=device),
+                    "rir_b_id": torch.randint(0, 10, (batch_size,), device=device),
+                    "wet_a": torch.rand(batch_size, device=device) * 0.5,
+                    "wet_b": torch.rand(batch_size, device=device) * 0.5,
+                    "noise": torch.randn(batch_size, 48000, device=device),
+                    "snr_db": torch.rand(batch_size, device=device) * 15.0,
+                }
                 labels = torch.randint(0, 2, (batch_size, 301), device=device, dtype=torch.float32)
                 step_target = torch.randint(0, 2, (batch_size, 301), device=device, dtype=torch.float32)
 
                 # Warmup
                 for _ in range(10):
                     optimizer.zero_grad(set_to_none=True)
-                    with torch.cuda.amp.autocast(enabled=use_amp):
+                    wav_input = gpu_aug(dummy_raw_batch)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
                         out = model(wav_input)
                         T_dim = min(out.shape[-1], labels.shape[-1])
                         loss = F.binary_cross_entropy_with_logits(out[:, 0, :T_dim], labels[:, :T_dim]) + \
@@ -151,7 +173,8 @@ def bench_gpu(batch_sizes, n_steps=100):
 
                 for _ in range(n_steps):
                     optimizer.zero_grad(set_to_none=True)
-                    with torch.cuda.amp.autocast(enabled=use_amp):
+                    wav_input = gpu_aug(dummy_raw_batch)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
                         out = model(wav_input)
                         T_dim = min(out.shape[-1], labels.shape[-1])
                         loss = F.binary_cross_entropy_with_logits(out[:, 0, :T_dim], labels[:, :T_dim]) + \
@@ -172,21 +195,36 @@ def bench_gpu(batch_sizes, n_steps=100):
                     f"({steps_per_sec:5.2f} steps/s) -> GPU consumes {consumed_wps:.1f} windows/s"
                 )
 
+
 def compare_pipeline(train_pool_dir, bank_dir, batch_size=64):
-    print("\n=== Pipeline Bottleneck Comparison ===")
+    print("\n=== Pipeline Bottleneck Comparison (With GPU Augmentations) ===")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
         print("  CUDA required for comparison benchmark.")
         return
 
-    # Benchmark GPU speed (FP32 baseline)
+    gpu_aug = GpuAugmentPipeline(bank_dir=bank_dir, split="train", device=device)
     model = SCDNet(n_mels=64, ch=64, kernel_size=5, dilations=(1, 2, 4, 8, 16), n_outputs=2).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    wav_input = torch.randn(batch_size, 48000, device=device)
+
+    dummy_raw_batch = {
+        "seg_a": torch.randn(batch_size, 48000, device=device),
+        "seg_b": torch.randn(batch_size, 48000, device=device),
+        "range_a": torch.tensor([[0, 24000]] * batch_size, device=device),
+        "range_b": torch.tensor([[24000, 48000]] * batch_size, device=device),
+        "rir_a_id": torch.randint(0, 10, (batch_size,), device=device),
+        "rir_b_id": torch.randint(0, 10, (batch_size,), device=device),
+        "wet_a": torch.rand(batch_size, device=device) * 0.5,
+        "wet_b": torch.rand(batch_size, device=device) * 0.5,
+        "noise": torch.randn(batch_size, 48000, device=device),
+        "snr_db": torch.rand(batch_size, device=device) * 15.0,
+    }
     labels = torch.randint(0, 2, (batch_size, 301), device=device, dtype=torch.float32)
 
+    # Warmup GPU
     for _ in range(10):
         optimizer.zero_grad(set_to_none=True)
+        wav_input = gpu_aug(dummy_raw_batch)
         out = model(wav_input)
         loss = F.binary_cross_entropy_with_logits(out[:, 0, :301], labels)
         loss.backward()
@@ -197,6 +235,7 @@ def compare_pipeline(train_pool_dir, bank_dir, batch_size=64):
     n_steps = 100
     for _ in range(n_steps):
         optimizer.zero_grad(set_to_none=True)
+        wav_input = gpu_aug(dummy_raw_batch)
         out = model(wav_input)
         loss = F.binary_cross_entropy_with_logits(out[:, 0, :301], labels)
         loss.backward()
@@ -209,8 +248,16 @@ def compare_pipeline(train_pool_dir, bank_dir, batch_size=64):
     # Benchmark loader speed (6 workers)
     num_workers = min(6, os.cpu_count() or 1)
     train_ds = OnTheFlyWindows(cfg=SamplerConfig(), pool_dir=train_pool_dir, bank_dir=bank_dir, split="train")
-    dl = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                    pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    dl = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+        collate_fn=raw_collate_fn,
+    )
     iterator = iter(dl)
     for _ in range(10):
         _ = next(iterator)
@@ -221,8 +268,8 @@ def compare_pipeline(train_pool_dir, bank_dir, batch_size=64):
     loader_elapsed = time.perf_counter() - t0
     loader_wps = (50 * batch_size) / loader_elapsed
 
-    print(f"  GPU Max Consumption Rate (FP32, BS={batch_size}): {gpu_wps:.1f} windows/s")
-    print(f"  DataLoader Throughput ({num_workers} workers, BS={batch_size}): {loader_wps:.1f} windows/s")
+    print(f"  GPU Max Processing Rate (Aug + Forward/Backward, BS={batch_size}): {gpu_wps:.1f} windows/s")
+    print(f"  DataLoader Throughput ({num_workers} workers, Raw Sampling, BS={batch_size}): {loader_wps:.1f} windows/s")
 
     ratio = loader_wps / gpu_wps
     if ratio >= 1.2:
@@ -235,8 +282,8 @@ def compare_pipeline(train_pool_dir, bank_dir, batch_size=64):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 0 Pipeline Benchmarking")
     parser.add_argument("--mode", choices=["sampler", "loader", "gpu", "compare", "all"], default="all")
-    parser.add_argument("--train_pool_dir", type=str, default="./data/pools/train")
-    parser.add_argument("--bank_dir", type=str, default="./data/aug_banks")
+    parser.add_argument("--train_pool_dir", type=str, default="C:/src/data/pools/train")
+    parser.add_argument("--bank_dir", type=str, default="C:/src/data/aug_banks")
     parser.add_argument("--workers", nargs="+", type=int, default=[4, 6, 8, 10])
     parser.add_argument("--batch_size", nargs="+", type=int, default=[64, 128])
     args = parser.parse_args()
@@ -254,7 +301,7 @@ if __name__ == "__main__":
             print(f"Skipping loader benchmark: {args.train_pool_dir}/pool.npy not found.")
 
     if args.mode in ["gpu", "all"]:
-        bench_gpu(args.batch_size)
+        bench_gpu(args.batch_size, bank_dir=args.bank_dir)
 
     if args.mode in ["compare", "all"]:
         if os.path.exists(f"{args.train_pool_dir}/pool.npy"):

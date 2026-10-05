@@ -121,15 +121,25 @@ def export_frame_labels(
     if use_soft_labels:
         sigma = tol_s * std_scale
         for cp in change_points:
-            dist = np.abs(frame_times_s - cp)
-            mask = dist <= tol_s
-            gaussian_vals = np.exp(-0.5 * (dist[mask] / sigma) ** 2)
+            # Only evaluate frames AT or AFTER the change point
+            mask = (frame_times_s >= cp) & (frame_times_s <= cp + tol_s)
+            dist = frame_times_s[mask] - cp
+            gaussian_vals = np.exp(-0.5 * (dist / sigma) ** 2)
             labels[mask] = np.maximum(labels[mask], gaussian_vals)
     else:
         for cp in change_points:
             labels[np.abs(frame_times_s - cp) <= tol_s] = 1.0
 
     return labels
+
+def load_random_wav_chunk(path: str, target_samples: int, rng: random.Random) -> np.ndarray:
+    audio = load_wav_mono16k(path)
+    if len(audio) <= target_samples:
+        return audio
+    # Pick a random starting sample so the window cuts mid-sentence
+    max_start = len(audio) - target_samples
+    start = rng.randint(0, max_start)
+    return audio[start : start + target_samples]
 
 
 def _save_window(
@@ -178,7 +188,7 @@ def concat_clips_to_duration(
     attempts = 0
     max_attempts = len(clips) * 5 + 10
     while len(out) < target_samples and attempts < max_attempts:
-        clip = normalize_lufs(load_wav_mono16k(clips[idx % len(clips)]))
+        clip = normalize_lufs(load_random_wav_chunk(clips[idx % len(clips)], target_samples, np.random))
         if len(out) > 0 and fade_samples > 0 and len(clip) > fade_samples:
             fade = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
             clip = clip.copy()
@@ -636,7 +646,8 @@ def generate_and_save_suite(
         change_fraction: float = 0.5,
         num_pairs: int = 300,
         frame_hop_ms: float = 10.0,
-        label_tolerance_ms: float = 150.0,
+        # label_tolerance_ms: float = 150.0,
+        label_tolerance_ms: float = 300.0,
         seed: int = 42,
 ):
     clips_db = load_speaker_clips(data_dir)
@@ -659,7 +670,8 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=str, default="data/speaker_tuning/speakers")
     parser.add_argument("--output-dir", type=str, default="data/speaker_tuning/synthetic")
     parser.add_argument("--frame-hop-ms", type=float, default=10.0)
-    parser.add_argument("--label-tolerance-ms", type=float, default=150.0)
+    # parser.add_argument("--label-tolerance-ms", type=float, default=150.0)
+    parser.add_argument("--label-tolerance-ms", type=float, default=300.0)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--window-duration-s", type=float, default=3.0)

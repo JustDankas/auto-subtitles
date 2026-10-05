@@ -1,5 +1,6 @@
 """
 build_pools.py -- Builds memory-mapped speaker audio pools from VoxCeleb / LibriSpeech.
+Includes speaker gender metadata parsing for downstream same-gender sampling.
 """
 import argparse
 import hashlib
@@ -22,6 +23,29 @@ def get_file_hash(filepath):
         while chunk := f.read(65536):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def load_speaker_genders(speakers_txt_path):
+    """
+    Parses LibriSpeech SPEAKERS.TXT to extract reader_id -> gender mapping.
+    Expected format: reader_id | gender | subset | minutes | name
+    """
+    genders = {}
+    if not speakers_txt_path or not Path(speakers_txt_path).exists():
+        return genders
+
+    with open(speakers_txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 2:
+                spk_id = parts[0]
+                gender = parts[1].upper()
+                if gender in ("M", "F"):
+                    genders[spk_id] = gender
+    return genders
 
 
 def _get_speaker_files(speaker_entry):
@@ -54,6 +78,7 @@ def process_split(
     min_clip_s=3.5,
     max_clip_s=15.0,
     seed=42,
+    gender_map=None,
 ):
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir) / split_name
@@ -61,6 +86,7 @@ def process_split(
 
     min_len = int(round(min_clip_s * SR))
     max_len = int(round(max_clip_s * SR))
+    gender_map = gender_map or {}
 
     # Parse speaker directories
     speakers_dict = {}
@@ -70,6 +96,8 @@ def process_split(
             speakers_dict[spk_id] = files
 
     spk_list = sorted(list(speakers_dict.keys()))
+    spk_genders = np.array([gender_map.get(spk, "U") for spk in spk_list], dtype="S1")
+
     print(
         f"[{split_name.upper()}] Processing {len(spk_list)} speakers "
         f"({clips_per_spk} clips/spk, min_clip_s={min_clip_s})..."
@@ -145,11 +173,12 @@ def process_split(
     mmap_arr.flush()
     del mmap_arr
 
-    # Save index
+    # Save index (including speaker genders)
     index_path = out_dir / "index.npz"
     np.savez_compressed(
         index_path,
         speakers=np.array(spk_list),
+        speaker_genders=spk_genders,
         clip_spk=clip_spk,
         clip_start=clip_start,
         clip_len=clip_len,
@@ -181,16 +210,18 @@ def process_split(
 def build_pools(
     splits_json,
     out_dir,
-    clips_per_spk=24,
+    clips_per_spk=48,
     min_clip_s=3.5,
-    max_clip_s=15.0,
+    max_clip_s=10.0,
     seed=42,
+    speakers_txt=None,
 ):
     splits_path = Path(splits_json)
     with open(splits_path, "r", encoding="utf-8") as f:
         splits = json.load(f)
 
     splits_hash = get_file_hash(splits_path)
+    gender_map = load_speaker_genders(speakers_txt) if speakers_txt else {}
 
     out_base = Path(out_dir)
     out_base.mkdir(parents=True, exist_ok=True)
@@ -202,6 +233,7 @@ def build_pools(
         "clips_per_spk": clips_per_spk,
         "min_clip_s": min_clip_s,
         "max_clip_s": max_clip_s,
+        "speakers_txt": str(Path(speakers_txt).resolve()) if speakers_txt else None,
     }
     with open(out_base / "meta.json", "w", encoding="utf-8") as f:
         json.dump(global_meta, f, indent=2)
@@ -216,17 +248,19 @@ def build_pools(
                 min_clip_s=min_clip_s,
                 max_clip_s=max_clip_s,
                 seed=seed,
+                gender_map=gender_map,
             )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build audio pools from speaker splits.")
-    parser.add_argument("--splits_json", default="./data/splits/splits.json")
-    parser.add_argument("--out_dir", default="./data/pools")
-    parser.add_argument("--clips_per_spk", type=int, default=24)
+    parser.add_argument("--splits_json", default="C:/src/data/splits/splits.json")
+    parser.add_argument("--out_dir", default="C:/src/data/pools")
+    parser.add_argument("--clips_per_spk", type=int, default=48)
     parser.add_argument("--min_clip_s", type=float, default=3.5)
-    parser.add_argument("--max_clip_s", type=float, default=15.0)
+    parser.add_argument("--max_clip_s", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--speakers_txt", default="C:/src/data/LibriSpeech/SPEAKERS.txt", help="Path to LibriSpeech SPEAKERS.TXT for gender metadata.")
     args = parser.parse_args()
 
     build_pools(
@@ -236,4 +270,5 @@ if __name__ == "__main__":
         min_clip_s=args.min_clip_s,
         max_clip_s=args.max_clip_s,
         seed=args.seed,
+        speakers_txt=args.speakers_txt,
     )

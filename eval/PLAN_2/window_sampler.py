@@ -2,7 +2,7 @@
 window_sampler.py -- On-the-fly synthetic speaker-change windows (numpy/scipy only).
 
 Replaces the fixed pre-generated window files. Every call to `sample(rng)` builds a
-brand-new `window_s`-second clip from a memory-mapped speaker pool (see build_pool.py):
+brand-new `window_s`-second clip from a memory-mapped speaker pool (see build_pools.py):
 
   kind "change"   : speaker A, then a DIFFERENT speaker B          -> Gaussian bump at t_change
   kind "fake"     : the SAME speaker on both sides (different utterances), with the same
@@ -17,7 +17,7 @@ from fractions import Fraction
 
 import numpy as np
 from aug_assets import AugmentAssets, apply_reverb, mix_background_noise
-from scipy.signal import resample_poly
+from scipy.signal import firwin, resample_poly
 
 SR = 16000
 
@@ -36,6 +36,21 @@ class Pool:
         self.clip_start = idx["clip_start"]
         self.clip_len = idx["clip_len"]
         self.spk_clips = [np.flatnonzero(self.clip_spk == i) for i in range(len(self.speakers))]
+
+        # Load speaker gender metadata if present (defaults to unknown 'U')
+        if "speaker_genders" in idx:
+            self.speaker_genders = np.array([
+                g.decode("utf-8") if isinstance(g, bytes) else str(g)
+                for g in idx["speaker_genders"]
+            ])
+        else:
+            self.speaker_genders = np.array(["U"] * len(self.speakers))
+
+        # Pre-group indices by gender for fast same-gender lookup ('M', 'F')
+        self.gender_to_spk_indices = {
+            "M": np.flatnonzero(self.speaker_genders == "M"),
+            "F": np.flatnonzero(self.speaker_genders == "F"),
+        }
 
         # Pool Diagnostics
         min_samples = int(3.0 * SR)
@@ -75,6 +90,7 @@ class SamplerConfig:
     # Prior probabilities
     p_change: float = 0.4
     p_fake: float = 0.4                      # Rest (0.2) = nochange
+    p_same_gender: float = 0.5               # Chance to draw same-gender speaker B for change windows
     
     speed_factors: tuple = (0.9, 1.1)
     p_speed: float = 0.5           # chance a segment becomes a speed-perturbed pseudo-speaker (0 for val/test)
@@ -90,32 +106,28 @@ def _fit(x, n):
     return x[:n] if len(x) >= n else np.pad(x, (0, n - len(x)))
 
 
-def _rms_db(x):
-    return 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-9)
-
-
 def _active_ratio(x, frame=400):
     n = len(x) // frame
     if n == 0:
         return 0.0
-    rms = np.sqrt(np.mean(x[: n * frame].reshape(n, frame) ** 2, axis=1))
-    return float(np.mean(rms > max(0.1 * np.percentile(rms, 95), 1e-5)))
-
-
-def _change_speed(x, s):
-    f = Fraction(1.0 / s).limit_denominator(20)                 # 0.9 -> 10/9, 1.1 -> 10/11
-    return resample_poly(x, f.numerator, f.denominator).astype(np.float32)
+    # Compute mean square power per frame
+    m = np.mean(x[: n * frame].reshape(n, frame) ** 2, axis=1)
+    k = min(n - 1, int(0.95 * n))
+    p95_sq = np.partition(m, k)[k]
+    thresh = max(0.01 * p95_sq, 1e-10)
+    return float(np.mean(m > thresh))
 
 
 def _fade(x, n, out):
     n = min(int(n), len(x))
     if n <= 0:
         return x
-    x = x.copy()
+    # Fade in-place on the allocated x array
+    ramp = np.linspace(1.0 if out else 0.0, 0.0 if out else 1.0, n, dtype=np.float32)
     if out:
-        x[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32)
+        x[-n:] *= ramp
     else:
-        x[:n] *= np.linspace(0.0, 1.0, n, dtype=np.float32)
+        x[:n] *= ramp
     return x
 
 
@@ -135,23 +147,39 @@ class WindowSampler:
         self.n_frames = int(np.ceil(c.window_s * 1000 / c.frame_hop_ms))
         self.frame_t = np.arange(self.n_frames) * (c.frame_hop_ms / 1000.0)
 
+        # Precompute label parameters
+        self.tol = c.tol_ms / 1000.0
+        self.inv_denom_sq = -0.5 / ((self.tol * c.std_scale) ** 2)
+
+        # Precompute resample FIR filters for speed factors
+        self.speed_resamplers = {}
+        for s in set(c.speed_factors):
+            f = Fraction(1.0 / s).limit_denominator(20)
+            up, down = f.numerator, f.denominator
+            max_rate = max(up, down)
+            f_c = 1.0 / max_rate
+            half_len = 10 * max_rate
+            filt = firwin(2 * half_len + 1, f_c, window=("kaiser", 5.0))
+            self.speed_resamplers[s] = (up, down, filt)
+
     def _crop(self, spk, n, rng, exclude=None):
         p = self.pool
         cids = p.spk_clips[spk]
         ok = cids[p.clip_len[cids] >= n]
         if exclude is not None and len(ok) > 1:
             ok = ok[ok != exclude]
+        inv_scale = np.float32(1.0 / 32768.0)
         if len(ok) > 0:
             cid = int(ok[int(rng.integers(len(ok)))])
             a = int(p.clip_start[cid]) + int(rng.integers(0, int(p.clip_len[cid]) - n + 1))
-            return np.asarray(p.audio[a:a + n], dtype=np.float32) / 32768.0, cid
+            return p.audio[a:a + n].astype(np.float32) * inv_scale, cid
             
         parts, got, first = [], 0, None
         while got < n:
             cid = int(cids[int(rng.integers(len(cids)))])
             first = cid if first is None else first
             a, L = int(p.clip_start[cid]), int(p.clip_len[cid])
-            parts.append(np.asarray(p.audio[a:a + L], dtype=np.float32) / 32768.0)
+            parts.append(p.audio[a:a + L].astype(np.float32) * inv_scale)
             got += L
         return np.concatenate(parts)[:n], first
 
@@ -162,6 +190,10 @@ class WindowSampler:
             return float(c.speed_factors[idx])
         return 1.0
 
+    def _change_speed(self, x, s):
+        up, down, filt = self.speed_resamplers[s]
+        return resample_poly(x, up, down, window=filt).astype(np.float32)
+
     def _segment(self, spk, dur_s, rng, speed=1.0, exclude=None):
         need = int(round(dur_s * SR))
         src = int(np.ceil(need * speed)) + 8
@@ -170,15 +202,21 @@ class WindowSampler:
             if _active_ratio(x) >= self.cfg.min_active_ratio:
                 break
         if speed != 1.0:
-            x = _change_speed(x, speed)
+            x = self._change_speed(x, speed)
         return _fit(x, need), cid
 
     def _level(self, x, rng):
-        x = x * 10 ** ((-23.0 - _rms_db(x)) / 20)
+        rms = np.sqrt(np.mean(x ** 2)) + 1e-9
+        # 10 ** (-23 / 20) == 0.07079457843841379
+        base_scale = 0.07079457843841379 / rms
         j = self.cfg.gain_jitter_db
-        return x * 10 ** (rng.uniform(-j, j) / 20) if j > 0 else x
+        if j > 0:
+            scale = base_scale * (10.0 ** (rng.uniform(-j, j) * 0.05))
+        else:
+            scale = base_scale
+        return x * scale
 
-    def sample(self, rng):
+    def sample(self, rng, raw=False):
         c, W = self.cfg, self.n_samples
         r = rng.random()
         kind = "change" if r < c.p_change else ("fake" if r < c.p_change + c.p_fake else "nochange")
@@ -186,32 +224,57 @@ class WindowSampler:
         a = int(rng.integers(self.n_spk))
         b, tc, gap = a, None, 0.0
 
-        # --- 1. Segment Generation & RIR Reverberation Strategy ---
         apply_rir_flag = (self.assets is not None) and (rng.random() < c.p_rir)
         rir_same = False
 
+        # Prepare arrays for channel A and channel B
+        seg_a = np.zeros(W, dtype=np.float32)
+        seg_b = np.zeros(W, dtype=np.float32)
+        range_a = [0, W]
+        range_b = [0, W]
+
+        rir_a_id = -1
+        rir_b_id = -1
+        wet_a = 0.0
+        wet_b = 0.0
+
         if kind == "nochange":
             x, _ = self._segment(a, c.window_s, rng, self._rand_speed(rng))
-            x = self._level(x, rng).astype(np.float32)
-            
+            x = self._level(x, rng)
+            seg_a[:len(x)] = x[:W]
+            range_a = [0, len(x)]
+
             if apply_rir_flag:
-                rir_a = self.assets.sample_rir(rng, max_ms=c.rir_max_ms)
-                wet_ratio = float(rng.uniform(*c.rir_wet_range))
-                canvas = apply_reverb(x, rir_a, active_range=(0, len(x)), wet_ratio=wet_ratio)
-            else:
-                canvas = x
+                wet_a = float(rng.uniform(*c.rir_wet_range))
+                if raw:
+                    rir_a_id = self.assets.sample_rir_id(rng, max_ms=c.rir_max_ms)
+                else:
+                    rir_a = self.assets.sample_rir(rng, max_ms=c.rir_max_ms)
+                    seg_a = apply_reverb(seg_a, rir_a, active_range=(0, len(x)), wet_ratio=wet_a)
 
         else:
             tc = float(rng.uniform(c.min_segment_s, c.window_s - c.min_segment_s))
             gap_idx = int(rng.integers(len(c.gap_options)))
             gap = float(c.gap_options[gap_idx])
             
+            # Global speed factor per window across both sides to prevent label leaks
+            sa = sb = self._rand_speed(rng)
+
             if kind == "change":
-                b = int(rng.integers(self.n_spk - 1))
-                b += b >= a
-                sa, sb = self._rand_speed(rng), self._rand_speed(rng)
-            else:
-                sa = sb = self._rand_speed(rng)
+                spk_a_gender = self.pool.speaker_genders[a]
+                same_gender_candidates = self.pool.gender_to_spk_indices.get(spk_a_gender, np.array([], dtype=int))
+                same_gender_candidates = same_gender_candidates[same_gender_candidates != a]
+
+                # Sample same-gender speaker with probability p_same_gender if candidates exist
+                if (
+                    c.p_same_gender > 0
+                    and len(same_gender_candidates) > 0
+                    and rng.random() < c.p_same_gender
+                ):
+                    b = int(same_gender_candidates[int(rng.integers(len(same_gender_candidates)))])
+                else:
+                    b = int(rng.integers(self.n_spk - 1))
+                    b += b >= a
 
             xa, ca = self._segment(a, tc - gap, rng, sa)
             xb, _ = self._segment(b, c.window_s - tc, rng, sb, exclude=ca if kind == "fake" else None)
@@ -220,56 +283,89 @@ class WindowSampler:
             xa = _fade(self._level(xa, rng), fa, out=True)
             xb = _fade(self._level(xb, rng), fb, out=False)
 
-            ca_arr = np.zeros(W, dtype=np.float32)
-            cb_arr = np.zeros(W, dtype=np.float32)
-
             len_a = min(len(xa), W)
-            ca_arr[:len_a] = xa[:len_a]
+            seg_a[:len_a] = xa[:len_a]
+            range_a = [0, len_a]
             
             s0 = int(round(tc * SR))
             len_b = min(len(xb), W - s0)
             if len_b > 0 and s0 < W:
-                cb_arr[s0:s0 + len_b] = xb[:len_b]
+                seg_b[s0:s0 + len_b] = xb[:len_b]
+                range_b = [s0, s0 + len_b]
 
             if apply_rir_flag:
-                wet_ratio = float(rng.uniform(*c.rir_wet_range))
-                rir_a = self.assets.sample_rir(rng, max_ms=c.rir_max_ms)
-                
-                if rng.random() < c.p_same_rir:
-                    rir_b = rir_a
-                    rir_same = True
+                wet_a = wet_b = float(rng.uniform(*c.rir_wet_range))
+                if raw:
+                    rir_a_id = self.assets.sample_rir_id(rng, max_ms=c.rir_max_ms)
+                    if rng.random() < c.p_same_rir:
+                        rir_b_id = rir_a_id
+                        rir_same = True
+                    else:
+                        rir_b_id = self.assets.sample_rir_id(rng, max_ms=c.rir_max_ms)
                 else:
-                    rir_b = self.assets.sample_rir(rng, max_ms=c.rir_max_ms)
+                    rir_a = self.assets.sample_rir(rng, max_ms=c.rir_max_ms)
+                    if rng.random() < c.p_same_rir:
+                        rir_b = rir_a
+                        rir_same = True
+                    else:
+                        rir_b = self.assets.sample_rir(rng, max_ms=c.rir_max_ms)
 
-                ca_arr = apply_reverb(ca_arr, rir_a, active_range=(0, len_a), wet_ratio=wet_ratio)
-                cb_arr = apply_reverb(cb_arr, rir_b, active_range=(s0, s0 + len_b), wet_ratio=wet_ratio)
+                    seg_a = apply_reverb(seg_a, rir_a, active_range=(0, len_a), wet_ratio=wet_a)
+                    seg_b = apply_reverb(seg_b, rir_b, active_range=(s0, s0 + len_b), wet_ratio=wet_b)
 
-            canvas = ca_arr + cb_arr
-
-        # Background Noise / Music Injection
+        # Background Noise / Music Selection
         snr_db = np.nan
         noise_cat = "none"
+        noise = np.zeros(W, dtype=np.float32)
+
         if (self.assets is not None) and (rng.random() < c.p_musan):
             cat_idx = int(rng.integers(len(c.musan_types)))
             noise_cat = str(c.musan_types[cat_idx])
             snr_db = float(rng.uniform(*c.musan_snr_db_range))
-            bg_noise = self.assets.sample_noise(noise_cat, W, rng)
-            canvas = mix_background_noise(canvas, bg_noise, snr_db=snr_db)
-
-        # Peak normalization guard
-        m = float(np.abs(canvas).max())
-        if m > 0.99:
-            canvas = canvas / m * 0.99
+            noise = self.assets.sample_noise(noise_cat, W, rng)
 
         # Labels Generation
         labels = np.zeros(self.n_frames, np.float32)
         step = np.zeros(self.n_frames, np.float32)
         if kind == "change":
-            tol = c.tol_ms / 1000.0
             d = np.abs(self.frame_t - tc)
-            m_ = d <= tol
-            labels[m_] = np.exp(-0.5 * (d[m_] / (tol * c.std_scale)) ** 2)
+            m_ = d <= self.tol
+            labels[m_] = np.exp((d[m_] ** 2) * self.inv_denom_sq)
             step[self.frame_t >= tc] = 1.0
+
+        if raw:
+            return dict(
+                seg_a=seg_a,
+                seg_b=seg_b,
+                range_a=np.array(range_a, dtype=np.int64),
+                range_b=np.array(range_b, dtype=np.int64),
+                rir_a_id=rir_a_id,
+                rir_b_id=rir_b_id,
+                wet_a=wet_a,
+                wet_b=wet_b,
+                noise=noise,
+                snr_db=snr_db,
+                labels=labels,
+                step=step,
+                kind=kind,
+                t_change=tc if kind == "change" else np.nan,
+                spk_a=a,
+                spk_b=b,
+                gap=gap,
+                rir=apply_rir_flag,
+                rir_same=rir_same,
+                noise_cat=noise_cat,
+            )
+
+        # CPU Path Output (Fully blended waveform)
+        canvas = seg_a + seg_b
+        if not np.isnan(snr_db):
+            canvas = mix_background_noise(canvas, noise, snr_db=snr_db)
+
+        # Peak normalization guard
+        m = float(np.abs(canvas).max())
+        if m > 0.99:
+            canvas = canvas / m * 0.99
 
         return dict(
             wave=canvas.astype(np.float32),
@@ -303,7 +399,7 @@ def make_fixed_set(sampler, n, seed, path):
     snr_dbs = np.zeros(n, np.float32)
 
     for i in range(n):
-        s = sampler.sample(rng)
+        s = sampler.sample(rng, raw=False)
         waves[i] = np.clip(s["wave"] * 32767.0, -32768, 32767).astype(np.int16)
         labels[i] = s["labels"]
         step[i] = s["step"]

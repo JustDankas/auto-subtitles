@@ -1,6 +1,7 @@
 """
-train.py -- Step 4 training recipe (see scd_plateau_plan.md and IMPROVEMENTS_PLAN_2.md).
-Updated to implement Sections D (Loop & Schedule), E (Loss Weights), and F (Checkpoints, Resume, EMA).
+train.py -- Step 6 training recipe implementation.
+Features: Step-based schedule, vectorised GPU augmentation, curriculum warmup, 
+AP-based selection, per-kind diagnostic logging, and checkpointing.
 """
 import argparse
 import copy
@@ -19,28 +20,31 @@ import torch
 import torch.nn.functional as F
 from aug_assets import AugmentAssets
 from eval_utils import false_alarm_by_kind, full_report
-from model import SCDNet
+from gpu_aug import GpuAugmentPipeline
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from window_sampler import Pool, SamplerConfig, WindowSampler, make_fixed_set
+
+from scd_model import SCDNet
 
 
 # ---------------------------------------------------------------------------
 # Worker Initialization & Datasets
 # ---------------------------------------------------------------------------
 def worker_init(worker_id: int):
-    """Worker initialization function for deterministic multi-worker data loading."""
+    """Worker initialization function with start_step offset to guarantee non-repeating streams on resume."""
     torch.set_num_threads(1)
     worker_info = torch.utils.data.get_worker_info()
     if worker_info is not None:
         ds = worker_info.dataset
-        seed = (ds.seed + worker_id) & 0xFFFFFFFF
+        start_step = getattr(ds, "start_step", 0)
+        seed = (ds.seed + 1000 * start_step + worker_id) & 0xFFFFFFFF
         ds.setup(np.random.default_rng(seed))
 
 
 class OnTheFlyWindows(Dataset):
     """
-    Generates a fresh window on every __getitem__ call.
+    Generates raw un-convolved speaker segments and metadata on every __getitem__ call.
     Pool and WindowSampler are constructed per worker in setup().
     """
 
@@ -52,6 +56,7 @@ class OnTheFlyWindows(Dataset):
         split: str = "train",
         seed: int = 0,
         no_wave_aug: bool = False,
+        start_step: int = 0,
     ):
         self.pool_dir = pool_dir
         self.cfg = cfg
@@ -59,6 +64,7 @@ class OnTheFlyWindows(Dataset):
         self.split = split
         self.seed = seed
         self.no_wave_aug = no_wave_aug
+        self.start_step = start_step
 
         self.pool = None
         self.sampler = None
@@ -70,16 +76,8 @@ class OnTheFlyWindows(Dataset):
         self.pool = Pool(f"{self.pool_dir}/pool.npy", f"{self.pool_dir}/index.npz", mmap=True)
 
         if not self.no_wave_aug:
-            if self.bank_dir is not None:
-                assets = AugmentAssets(
-                    bank_dir=self.bank_dir,
-                    split=self.split
-                )
-            else:
-                assets = AugmentAssets(
-                    bank_dir="./data/aug_banks",
-                    split=self.split
-                )
+            bank_path = self.bank_dir if self.bank_dir is not None else "./data/aug_banks"
+            assets = AugmentAssets(bank_dir=bank_path, split=self.split)
         else:
             assets = None
 
@@ -90,14 +88,24 @@ class OnTheFlyWindows(Dataset):
 
     def __getitem__(self, idx):
         if self.sampler is None:
-            self.setup(np.random.default_rng(self.seed))
+            seed = (self.seed + 1000 * self.start_step) & 0xFFFFFFFF
+            self.setup(np.random.default_rng(seed))
 
-        s = self.sampler.sample(self.rng)
-        return (
-            torch.from_numpy(s["wave"]),
-            torch.from_numpy(s["labels"]),
-            torch.from_numpy(s["step"]),
-        )
+        s = self.sampler.sample(self.rng, raw=True)
+        return s
+
+
+def raw_collate_fn(batch):
+    """Custom collate function to construct PyTorch batch tensors from raw sampler dicts."""
+    res = {}
+    for key in batch[0].keys():
+        if isinstance(batch[0][key], np.ndarray):
+            res[key] = torch.from_numpy(np.stack([b[key] for b in batch]))
+        elif isinstance(batch[0][key], (int, float, bool)):
+            res[key] = torch.tensor([b[key] for b in batch])
+        else:
+            res[key] = [b[key] for b in batch]
+    return res
 
 
 class FixedWindowSet(Dataset):
@@ -131,40 +139,43 @@ class FixedWindowSet(Dataset):
 
 
 class EMA:
-    """Exponential Moving Average wrapper for model parameters."""
+    """Exponential Moving Average wrapper for model parameters with warmup and BN synchronization."""
 
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+    def __init__(self, model, decay=0.999):
         self.decay = decay
-        self.shadow = {
-            name: param.clone().detach()
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        }
+        self.model = copy.deepcopy(model).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.n = 0
 
-    def update(self, model: torch.nn.Module):
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    self.shadow[name].sub_((1.0 - self.decay) * (self.shadow[name] - param))
+    @torch.no_grad()
+    def update(self, model):
+        self.n += 1
+        d = min(self.decay, (1 + self.n) / (10 + self.n))  # Warmup
+        ep = [p for p in self.model.parameters()]
+        mp = [p for p in model.parameters()]
+        torch._foreach_lerp_(ep, mp, 1.0 - d)
+        for be, bm in zip(self.model.buffers(), model.buffers()):
+            be.copy_(bm)
 
     def copy_to(self, model: torch.nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name])
+        model.load_state_dict(self.model.state_dict())
 
     def state_dict(self):
-        return self.shadow
+        return {"model": self.model.state_dict(), "n": self.n}
 
     def load_state_dict(self, state_dict):
-        for name, tensor in state_dict.items():
-            if name in self.shadow:
-                self.shadow[name].copy_(tensor)
+        if "model" in state_dict:
+            self.model.load_state_dict(state_dict["model"])
+            self.n = state_dict.get("n", 0)
+        else:
+            for name, param in self.model.named_parameters():
+                if name in state_dict:
+                    param.data.copy_(state_dict[name])
 
 
 def analytic_pos_weight(cfg: SamplerConfig, mode: str) -> float:
-    """
-    Analytically computes the frame-wise positive label ratio based on SamplerConfig parameters.
-    """
+    """Analytically computes the frame-wise positive label ratio based on SamplerConfig parameters."""
     n_frames = int(cfg.window_s * 1000 / cfg.frame_hop_ms)
     ft = np.arange(n_frames) * cfg.frame_hop_ms / 1000.0
     tol = cfg.tol_ms / 1000.0
@@ -262,10 +273,6 @@ def save_history_csv(history: Dict[str, list], csv_path: str):
 
 @torch.no_grad()
 def run_validation(model, val_dl, device, aux_weight, pos_weight, use_amp):
-    """
-    Evaluates model on val_dl.
-    Computes loss with training pos_weight and computes per-kind false alarm rates.
-    """
     model.eval()
     probs_all, labels_all, loss_sum, n_batches = [], [], 0.0, 0
     kinds_all = []
@@ -292,8 +299,35 @@ def run_validation(model, val_dl, device, aux_weight, pos_weight, use_amp):
     kinds = np.array(kinds_all)
 
     report = full_report(probs, labels)
-    fa_rates = false_alarm_by_kind(probs, kinds, thr=0.5)
-    report["fa_by_kind"] = fa_rates
+
+    # Compute per-kind mean probability diagnostic
+    mean_probs = {}
+    for k in np.unique(kinds):
+        mask = (kinds == k)
+        mean_probs[str(k)] = float(probs[mask].mean()) if mask.any() else 0.0
+    report["mean_probs_by_kind"] = mean_probs
+
+    # Sweep thresholds to select the optimal decision boundary
+    best_f1, best_thr = -1.0, 0.5
+    best_fa = {}
+
+    for thr in np.arange(0.05, 0.96, 0.05):
+        fa_rates = false_alarm_by_kind(probs, kinds, thr=thr)
+        cur_f1 = report["event@200ms"]["f1"]
+        if cur_f1 > best_f1:
+            best_f1 = cur_f1
+            best_thr = float(thr)
+            best_fa = fa_rates
+
+    report["fa_by_kind"] = best_fa
+    report["best_threshold"] = best_thr
+
+    nochange_count = sum(1 for k in kinds_all if k == "nochange")
+    if nochange_count > 0:
+        total_nochange_mins = (nochange_count * 3.0) / 60.0
+        report["fa_per_min_nochange"] = best_fa.get("nochange", 0) / total_nochange_mins
+    else:
+        report["fa_per_min_nochange"] = 0.0
 
     return loss_sum / max(n_batches, 1), report
 
@@ -310,22 +344,22 @@ def train_model(
     bank_dir: Optional[str] = None,
     val_size: int = 3000,
     select_on: str = "aug",
-    total_steps: int = 40000,
-    eval_every: int = 1000,
+    total_steps: int = 100_000,
+    eval_every: int = 2000,
     log_every: int = 50,
     batch_size: int = 64,
     max_lr: float = 2e-3,
     weight_decay: float = 1e-2,
     ch: int = 64,
     kernel_size: int = 5,
-    dilations=(1, 2, 4, 8),
+    dilations=(1, 2, 4, 8, 16),
     dropout: float = 0.15,
     causal: bool = False,
     dense: bool = False,
     no_specaug: bool = False,
     no_wave_aug: bool = False,
     aux_weight: float = 0.5,
-    pos_weight_mode: str = "sqrt",
+    pos_weight_mode: str = "one",
     patience: int = 8,
     ema_decay: float = 0.999,
     resume_path: Optional[str] = None,
@@ -336,7 +370,7 @@ def train_model(
     seed: int = 0,
     sampler_overrides: Optional[Dict[str, Any]] = None,
 ):
-    # Set seeds across all frameworks
+    # Set framework seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -352,13 +386,15 @@ def train_model(
         use_amp = (device == "cuda")
     else:
         use_amp = False
+    print(f"Using AMP: {use_amp} | Device: {device} | Seed: {seed}")
 
+    # Worker count clamp to prevent page cache starvation
     if num_workers is None:
-        num_workers = max(1, (os.cpu_count() or 2) - 1)
+        num_workers = min(6, max(1, (os.cpu_count() or 2) - 1))
 
     pin_memory = (device == "cuda")
 
-    # Configs
+    # Sampler Configuration
     sampler_cfg = SamplerConfig()
     if sampler_overrides:
         for k, v in sampler_overrides.items():
@@ -374,6 +410,7 @@ def train_model(
         split="train",
         seed=seed,
         no_wave_aug=no_wave_aug,
+        start_step=0,
     )
 
     train_dl = DataLoader(
@@ -385,7 +422,15 @@ def train_model(
         persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         worker_init_fn=worker_init,
+        collate_fn=raw_collate_fn,
     )
+
+    # Vectorised GPU Augmenter
+    gpu_aug = GpuAugmentPipeline(
+        bank_dir=bank_dir or "./data/aug_banks",
+        split="train",
+        device=device,
+    ) if not no_wave_aug else None
 
     # Setup Dual Frozen Validation Sets
     val_clean_path = val_clean_path or f"{work_dir}/val_clean.npz"
@@ -412,7 +457,7 @@ def train_model(
     val_clean_dl = DataLoader(FixedWindowSet(val_clean_path), batch_size=batch_size * 2, shuffle=False)
     val_aug_dl = DataLoader(FixedWindowSet(val_aug_path), batch_size=batch_size * 2, shuffle=False)
 
-    # Analytic pos_weight calculation
+    # Analytic pos_weight
     pos_weight_value = analytic_pos_weight(sampler_cfg, mode=pos_weight_mode)
     print(f"pos_weight ({pos_weight_mode}) = {pos_weight_value:.3f} (analytic)")
     pos_weight = torch.tensor(pos_weight_value, device=device)
@@ -425,7 +470,7 @@ def train_model(
         "dropout": dropout,
         "causal": causal,
         "dense": dense,
-        "augment": not no_specaug,
+        "augment": not no_specaug, # Ensures frontend.augment is instantiated
         "n_outputs": 2,
     }
     model = SCDNet(**model_config).to(device)
@@ -438,7 +483,7 @@ def train_model(
     )
 
     start_step = 0
-    best_val_f1 = -1.0
+    best_val_ap = -1.0
     bad_evals = 0
 
     history = {k: [] for k in [
@@ -447,7 +492,7 @@ def train_model(
         "val_clean_loss", "val_clean_event_f1_200", "val_clean_AP", "val_clean_AUROC", "val_clean_lag_ms"
     ]}
 
-    # Resume capability
+    # Resume handling
     if resume_path and os.path.exists(resume_path):
         print(f"Resuming training from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
@@ -456,8 +501,9 @@ def train_model(
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt["step"]
-        best_val_f1 = ckpt["best_val_f1"]
+        best_val_ap = ckpt["best_val_ap"]
         history = ckpt["history"]
+        train_ds.start_step = start_step
         if ema and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
         if "rng" in ckpt:
@@ -479,7 +525,9 @@ def train_model(
     train_iter = iter(train_dl)
     model.train()
 
-    # GPU accumulators for non-blocking stats
+    # Store initial specaug instance reference if enabled
+    specaug_module = model.frontend.augment if not no_specaug else None
+
     loss_acc = torch.tensor(0.0, device=device)
     tp_acc = torch.tensor(0, dtype=torch.int64, device=device)
     fp_acc = torch.tensor(0, dtype=torch.int64, device=device)
@@ -492,14 +540,26 @@ def train_model(
 
     pbar = tqdm(range(start_step, total_steps), desc="Training", initial=start_step, total=total_steps)
     for step in pbar:
-        # Measure data wait time
-        wav, labels, step_gt = next(train_iter)
+        current_step = step + 1
+
+# Curriculum Warmup: Disable SpecAugment for the first 5000 steps
+        if not no_specaug:
+            if current_step <= 5000:
+                model.frontend.augment = None
+            else:
+                model.frontend.augment = specaug_module
+
+        batch_raw = next(train_iter)
         t1 = time.perf_counter()
         t_data_wait += (t1 - t0)
 
-        wav = wav.to(device, non_blocking=pin_memory)
-        labels = labels.to(device, non_blocking=pin_memory)
-        step_gt = step_gt.to(device, non_blocking=pin_memory)
+        labels = batch_raw["labels"].to(device, non_blocking=pin_memory)
+        step_gt = batch_raw["step"].to(device, non_blocking=pin_memory)
+
+        if gpu_aug is not None:
+            wav = gpu_aug(batch_raw)
+        else:
+            wav = (batch_raw["seg_a"] + batch_raw["seg_b"]).to(device, non_blocking=pin_memory)
 
         opt.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
@@ -519,7 +579,6 @@ def train_model(
         if ema:
             ema.update(model)
 
-        # GPU metrics accumulation (no syncs)
         with torch.no_grad():
             loss_acc += loss.detach()
             preds = (out[:, 0] > 0.0)
@@ -532,8 +591,6 @@ def train_model(
         t2 = time.perf_counter()
         t_step_proc += (t2 - t1)
         t0 = t2
-
-        current_step = step + 1
 
         # Periodic Logging
         if current_step % log_every == 0:
@@ -559,7 +616,6 @@ def train_model(
             current_train_loss = loss_val
             current_train_f1 = f1
 
-            # Reset Accumulators
             loss_acc.zero_()
             tp_acc.zero_()
             fp_acc.zero_()
@@ -570,13 +626,11 @@ def train_model(
 
         # Periodic Evaluation
         if current_step % eval_every == 0 or current_step == total_steps:
-            eval_model = copy.deepcopy(model)
-            if ema:
-                ema.copy_to(eval_model)
+            eval_model = ema.model if ema else model
+            eval_model.eval()
 
             val_aug_loss, aug_report = run_validation(eval_model, val_aug_dl, device, aux_weight, pos_weight, use_amp)
             val_clean_loss, clean_report = run_validation(eval_model, val_clean_dl, device, aux_weight, pos_weight, use_amp)
-            del eval_model
 
             history["step"].append(current_step)
             history["train_loss"].append(current_train_loss if 'current_train_loss' in locals() else 0.0)
@@ -599,13 +653,15 @@ def train_model(
 
             aug_fa = aug_report.get("fa_by_kind", {})
             clean_fa = clean_report.get("fa_by_kind", {})
+            aug_probs = aug_report.get("mean_probs_by_kind", {})
             print(
                 f"\n[Step {current_step}/{total_steps}]\n"
-                f"  [val_aug]   loss={val_aug_loss:.4f} event_f1@200ms={aug_report['event@200ms']['f1']:.4f} AP={aug_report['AP']:.4f} FA={aug_fa}\n"
+                f"  [val_aug]   loss={val_aug_loss:.4f} event_f1@200ms={aug_report['event@200ms']['f1']:.4f} AP={aug_report['AP']:.4f} "
+                f"FA={aug_fa} mean_probs={aug_probs}\n"
                 f"  [val_clean] loss={val_clean_loss:.4f} event_f1@200ms={clean_report['event@200ms']['f1']:.4f} AP={clean_report['AP']:.4f} FA={clean_fa}"
             )
 
-            # Checkpoint: Save Last State
+            # Checkpoint: Last State
             last_ckpt = {
                 "model": model.state_dict(),
                 "optimizer": opt.state_dict(),
@@ -613,7 +669,7 @@ def train_model(
                 "scaler": scaler.state_dict(),
                 "step": current_step,
                 "history": history,
-                "best_val_f1": best_val_f1,
+                "best_val_ap": best_val_ap,
                 "config": model_config,
                 "sampler_config": asdict(sampler_cfg),
                 "rng": {
@@ -626,26 +682,27 @@ def train_model(
                 last_ckpt["ema"] = ema.state_dict()
             torch.save(last_ckpt, os.path.join(ckpt_dir, "last.pt"))
 
-            # Checkpoint: Save Best Model
-            selected_val_f1 = aug_report["event@200ms"]["f1"] if select_on == "aug" else clean_report["event@200ms"]["f1"]
-            if selected_val_f1 > best_val_f1:
-                best_val_f1 = selected_val_f1
+            # Checkpoint: Best Model (selected via AP)
+            selected_val_metric = aug_report["AP"] if select_on == "aug" else clean_report["AP"]
+
+            if selected_val_metric > best_val_ap:
+                best_val_ap = selected_val_metric
                 bad_evals = 0
                 best_ckpt = {
-                    "model": model.state_dict(),
-                    "ema": ema.state_dict() if ema else None,
+                    "model": ema.model.state_dict() if ema else model.state_dict(),
                     "config": model_config,
                     "sampler_config": asdict(sampler_cfg),
                     "step": current_step,
                     "metrics": aug_report if select_on == "aug" else clean_report,
                     "select_on": select_on,
+                    "threshold": aug_report.get("best_threshold", 0.5)
                 }
                 torch.save(best_ckpt, os.path.join(ckpt_dir, "best.pt"))
-                print(f" Saved new best model checkpoint to best.pt (val_event_f1@200ms={best_val_f1:.4f})")
+                print(f" Saved new best model checkpoint to best.pt (val_{select_on}_AP={best_val_ap:.4f})")
             else:
                 bad_evals += 1
-                # Early Stopping: Active only after 30% of total steps
-                if current_step >= 0.30 * total_steps and bad_evals >= patience:
+                if current_step >= 0.40 * total_steps and bad_evals >= patience:
+                    plot_metrics(history, work_dir, tag, title_suffix)
                     print(f"\nEarly stopping triggered at step {current_step} (bad_evals={bad_evals})")
                     break
 
@@ -658,29 +715,29 @@ def train_model(
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Train SCDNet with step-based schedule and EMA.")
     p.add_argument("--work_dir", type=str, required=True)
-    p.add_argument("--train_pool_dir", type=str, required=True, help="dir with pool.npy + index.npz")
-    p.add_argument("--val_pool_dir", type=str, default=None, help="used only if val npz files don't exist yet")
-    p.add_argument("--val_clean_path", type=str, default=None, help="default: <work_dir>/val_clean.npz")
-    p.add_argument("--val_aug_path", type=str, default=None, help="default: <work_dir>/val_aug.npz")
-    p.add_argument("--bank_dir", type=str, default=None, help="Directory containing bank folders (e.g. ./data/aug_banks)")
+    p.add_argument("--train_pool_dir", type=str, default="C:/src/data/pools/train", help="dir with pool.npy + index.npz")
+    p.add_argument("--val_pool_dir", type=str, default="C:/src/data/pools/val", help="used only if val npz files don't exist yet")
+    p.add_argument("--val_clean_path", type=str, default="C:/src/data/pools/val_clean.npz", help="default: <work_dir>/val_clean.npz")
+    p.add_argument("--val_aug_path", type=str, default="C:/src/data/pools/val_aug.npz", help="default: <work_dir>/val_aug.npz")
+    p.add_argument("--bank_dir", type=str, default="C:/src/data/aug_banks", help="Directory containing bank folders (e.g. ./data/aug_banks)")
     p.add_argument("--val_size", type=int, default=3000)
     p.add_argument("--select_on", type=str, choices=["aug", "clean"], default="aug", help="Selection metric set")
-    p.add_argument("--total_steps", type=int, default=40000)
-    p.add_argument("--eval_every", type=int, default=1000)
+    p.add_argument("--total_steps", type=int, default=100_000)
+    p.add_argument("--eval_every", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--max_lr", type=float, default=2e-3)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--ch", type=int, default=64)
     p.add_argument("--kernel_size", type=int, default=5)
-    p.add_argument("--dilations", type=str, default="1,2,4,8")
+    p.add_argument("--dilations", type=str, default="1,2,4,8,16")
     p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument("--causal", action="store_true")
     p.add_argument("--dense", action="store_true", help="Use standard 1D convs instead of depthwise separable convs")
     p.add_argument("--no_specaug", action="store_true", help="Disable GPU SpecAugment")
     p.add_argument("--no_wave_aug", action="store_true", help="Disable waveform augmentations (reverb + noise)")
     p.add_argument("--aux_weight", type=float, default=0.5)
-    p.add_argument("--pos_weight_mode", type=str, default="sqrt", choices=["sqrt", "one", "full"])
+    p.add_argument("--pos_weight_mode", type=str, default="one", choices=["sqrt", "one", "full"])
     p.add_argument("--patience", type=int, default=8, help="Patience count in evals")
     p.add_argument("--ema", type=float, default=0.999, help="EMA decay rate (0.0 to disable)")
     p.add_argument("--resume", type=str, default=None, help="Path to checkpoint (e.g., last.pt) to resume training")
