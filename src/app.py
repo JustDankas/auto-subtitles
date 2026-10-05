@@ -46,7 +46,7 @@ def main() -> None:
     parser.add_argument("--scd-threshold", type=float, default=0.5, help="Smoothed change probability needed to fire (default: 0.6; tune at stream level, expect it to need to be higher than the training-optimal value)")
     parser.add_argument("--scd-hop", type=float, default=0.25, help="Seconds of new audio between SCD inferences (default: 0.25)")
     parser.add_argument("--scd-left-guard", type=float, default=0.5, help="Ignore peaks in the first N seconds of each 3 s window. The model never saw changes closer than 0.5 s to an edge (default: 0.5)")
-    parser.add_argument("--scd-right-guard", type=float, default=1.0, help="Ignore peaks in the last N seconds of the window; also ~the detection latency (default: 1.0)")
+    parser.add_argument("--scd-right-guard", type=float, default=0.5, help="Ignore peaks in the last N seconds of the window; also ~the detection latency (default: 0.5)")
     parser.add_argument("--scd-min-gap", type=float, default=1.0, help="Minimum seconds between two reported changes (default: 1.0)")
     parser.add_argument("--scd-reset-gap", type=float, default=1.5, help="Seconds of non-speech after which the SCD audio window is cleared (default: 1.5)")
     parser.add_argument("--scd-settle", type=float, default=0.1, help="Extra seconds to wait after asr-decode-lag before splitting a line (default: 0.1)")

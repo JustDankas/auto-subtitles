@@ -108,7 +108,7 @@ More examples:
 
 ```powershell
 # Speaker-change detection with suggested hyperparameters
-python src/app.py --scd-checkpoint models\scdnet_tcn_20261005_best.pt --scd-device cpu --scd-threshold 0.5
+python src/app.py --scd-checkpoint models\scdnet_tcn_20261005_best.pt --scd-device cpu --scd-threshold 0.3
 
 # Raise the VAD threshold to reject background music, and write to a custom log file
 python src/app.py --vad-threshold 0.5 --log-file lecture.jsonl
@@ -119,34 +119,34 @@ python src/app.py --click-through --new-text-color 00C3FF
 
 ### Command-line options
 
-| Option                             | Default            | Description                                                                          |
-| ---------------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
-| `--asr-model-dir`                  | required           | Folder containing the encoder, decoder, joiner, and `tokens.txt` files.              |
-| `--vad-model`                      | `silero_vad.onnx`  | Path to the Silero VAD model.                                                        |
-| `--provider`                       | `cpu`              | `cpu` or `cuda`. The CPU path is the tested one.                                     |
-| `--int8`                           | off                | Use the int8-quantized model files when the folder has them.                         |
-| `--log-file`                       | `transcript.jsonl` | Where finished lines are appended.                                                   |
-| `--vad-threshold`                  | `0.15`             | Speech probability cutoff. Raise it to reject music, lower it to catch quiet speech. |
-| `--min-silence`                    | `0.5`              | Seconds of silence before the VAD closes a speech region.                            |
-| `--rule2-silence`                  | `0.5`              | Seconds of trailing silence that end a caption line.                                 |
-| `--rule3-utterance`                | `12.0`             | Seconds of continuous speech after which a line break is forced.                     |
-| `--scd-checkpoint`                 | off                | Path to a trained SCDNet PyTorch checkpoint (`.pt`). Enables speaker-change splits.  |
-| `--scd-threshold`                  | `0.5`              | Smoothed change probability required to report a change.                             |
-| `--scd-hop`                        | `0.25`             | Seconds of new speech audio between SCD inference windows.                           |
-| `--scd-left-guard`                 | `0.5`              | Ignore candidate changes this close to the start of each 3-second window.            |
-| `--scd-right-guard`                | `1.0`              | Ignore candidate changes this close to the end of each window.                       |
-| `--scd-min-gap`                    | `1.0`              | Minimum seconds between reported changes.                                            |
-| `--scd-reset-gap`                  | `1.5`              | Clear the SCD audio window after this much non-speech.                               |
-| `--scd-settle`                     | `0.1`              | Extra wait after the ASR decode lag before splitting a line.                          |
-| `--scd-device`                     | `cpu`              | PyTorch device for SCD inference (`cpu` or `cuda`), independent of `--provider`.      |
-| `--scd-threads`                    | `1`                | Number of CPU threads used by SCD inference.                                         |
-| `--scd-debug-dump`                 | off                | Append per-window probabilities to this JSONL path for offline tuning.                |
-| `--asr-decode-lag`                 | `0.8`              | Estimated seconds from spoken word to ASR partial; used to align SCD splits.          |
-| `--new-text-color`                 | `#FFFF00`          | Color of the line currently being recognized.                                        |
-| `--old-text-color`                 | `#E5E5E5`          | Color of finished lines.                                                             |
-| `--width`, `--height`              | `900`, `160`       | Caption window size in pixels.                                                       |
-| `--x`, `--y`                       | `100`, `100`       | Initial window position.                                                             |
-| `--click-through`                  | off                | Let mouse clicks pass through the caption box. Experimental.                         |
+| Option                | Default            | Description                                                                          |
+| --------------------- | ------------------ | ------------------------------------------------------------------------------------ |
+| `--asr-model-dir`     | required           | Folder containing the encoder, decoder, joiner, and `tokens.txt` files.              |
+| `--vad-model`         | `silero_vad.onnx`  | Path to the Silero VAD model.                                                        |
+| `--provider`          | `cpu`              | `cpu` or `cuda`. The CPU path is the tested one.                                     |
+| `--int8`              | off                | Use the int8-quantized model files when the folder has them.                         |
+| `--log-file`          | `transcript.jsonl` | Where finished lines are appended.                                                   |
+| `--vad-threshold`     | `0.15`             | Speech probability cutoff. Raise it to reject music, lower it to catch quiet speech. |
+| `--min-silence`       | `0.5`              | Seconds of silence before the VAD closes a speech region.                            |
+| `--rule2-silence`     | `0.5`              | Seconds of trailing silence that end a caption line.                                 |
+| `--rule3-utterance`   | `12.0`             | Seconds of continuous speech after which a line break is forced.                     |
+| `--scd-checkpoint`    | off                | Path to a trained SCDNet PyTorch checkpoint (`.pt`). Enables speaker-change splits.  |
+| `--scd-threshold`     | `0.5`              | Smoothed change probability required to report a change.                             |
+| `--scd-hop`           | `0.25`             | Seconds of new speech audio between SCD inference windows.                           |
+| `--scd-left-guard`    | `0.5`              | Ignore candidate changes this close to the start of each 3-second window.            |
+| `--scd-right-guard`   | `1.0`              | Ignore candidate changes this close to the end of each window.                       |
+| `--scd-min-gap`       | `1.0`              | Minimum seconds between reported changes.                                            |
+| `--scd-reset-gap`     | `1.5`              | Clear the SCD audio window after this much non-speech.                               |
+| `--scd-settle`        | `0.1`              | Extra wait after the ASR decode lag before splitting a line.                         |
+| `--scd-device`        | `cpu`              | PyTorch device for SCD inference (`cpu` or `cuda`), independent of `--provider`.     |
+| `--scd-threads`       | `1`                | Number of CPU threads used by SCD inference.                                         |
+| `--scd-debug-dump`    | off                | Append per-window probabilities to this JSONL path for offline tuning.               |
+| `--asr-decode-lag`    | `0.8`              | Estimated seconds from spoken word to ASR partial; used to align SCD splits.         |
+| `--new-text-color`    | `#FFFF00`          | Color of the line currently being recognized.                                        |
+| `--old-text-color`    | `#E5E5E5`          | Color of finished lines.                                                             |
+| `--width`, `--height` | `900`, `160`       | Caption window size in pixels.                                                       |
+| `--x`, `--y`          | `100`, `100`       | Initial window position.                                                             |
+| `--click-through`     | off                | Let mouse clicks pass through the caption box. Experimental.                         |
 
 ## Output
 
@@ -196,20 +196,20 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 
 ### Modules
 
-| File                   | Role                                                                                                  |
-| ---------------------- | ----------------------------------------------------------------------------------------------------- |
-| `audio_capture.py`     | WASAPI loopback capture through PyAudioWPatch, plus downmix and resampling.                           |
-| `ring_buffer.py`       | Thread-safe circular buffer with dropped-audio counters.                                              |
-| `vad_gate.py`          | Wraps sherpa-onnx's Silero VAD and buffers arbitrary-length input into exact 512-sample windows.      |
-| `asr_engine.py`        | Persistent `OnlineStream` with endpoint detection and a confidence estimate.                          |
-| `pipeline_worker.py`   | The `QThread` that connects capture, VAD, ASR, optional SCD, and logging, and emits GUI signals.        |
-| `scd_detector.py`      | Runs sliding-window SCD inference and converts model probabilities into audio-clock change events.     |
-| `scd_model.py`         | PyTorch SCDNet model and log-mel feature extraction used by the detector.                                |
-| `text_formatter.py`    | Number formatter that handles years, fractions, thousands.                                            |
-| `transcript_logger.py` | Console and JSONL logging, flushed per line.                                                          |
-| `overlay_window.py`    | Caption window with per-line boxes that fade and shrink.                                              |
-| `drag_handle.py`       | Separate always-interactive window for dragging and closing.                                          |
-| `app.py`               | Entry point: parses arguments, wires signals, starts the worker.                                      |
+| File                   | Role                                                                                               |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `audio_capture.py`     | WASAPI loopback capture through PyAudioWPatch, plus downmix and resampling.                        |
+| `ring_buffer.py`       | Thread-safe circular buffer with dropped-audio counters.                                           |
+| `vad_gate.py`          | Wraps sherpa-onnx's Silero VAD and buffers arbitrary-length input into exact 512-sample windows.   |
+| `asr_engine.py`        | Persistent `OnlineStream` with endpoint detection and a confidence estimate.                       |
+| `pipeline_worker.py`   | The `QThread` that connects capture, VAD, ASR, optional SCD, and logging, and emits GUI signals.   |
+| `scd_detector.py`      | Runs sliding-window SCD inference and converts model probabilities into audio-clock change events. |
+| `scd_model.py`         | PyTorch SCDNet model and log-mel feature extraction used by the detector.                          |
+| `text_formatter.py`    | Number formatter that handles years, fractions, thousands.                                         |
+| `transcript_logger.py` | Console and JSONL logging, flushed per line.                                                       |
+| `overlay_window.py`    | Caption window with per-line boxes that fade and shrink.                                           |
+| `drag_handle.py`       | Separate always-interactive window for dragging and closing.                                       |
+| `app.py`               | Entry point: parses arguments, wires signals, starts the worker.                                   |
 
 ### Design decisions
 
@@ -229,16 +229,16 @@ Three threads run at once. PortAudio's callback thread captures audio. A `QThrea
 
 ## Tuning
 
-| Symptom                                       | Try                                                                                                              |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Captions appear for music or background noise | Raise `--vad-threshold` to 0.4 or 0.6.                                                                           |
-| Quiet speech is missed                        | Lower `--vad-threshold` to 0.1 or 0.3.                                                                           |
-| Captions lag behind the speaker               | Lower `--rule2-silence` and `--rule3-utterance`.                                                                 |
-| Sentences split in the middle                 | Raise `--rule2-silence` and `--min-silence`.                                                                     |
-| CPU usage is high                             | Add `--int8`.                                                                                                    |
-| Speaker changes are missed                    | Lower `--scd-threshold`; check that a checkpoint is supplied with `--scd-checkpoint`.                            |
-| Speaker lines split too often                 | Raise `--scd-threshold` or `--scd-min-gap`.                                                                      |
-| Speaker split boundaries feel early or late   | Tune `--scd-right-guard` and `--asr-decode-lag`; both affect the alignment/latency tradeoff.                      |
+| Symptom                                       | Try                                                                                          |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Captions appear for music or background noise | Raise `--vad-threshold` to 0.4 or 0.6.                                                       |
+| Quiet speech is missed                        | Lower `--vad-threshold` to 0.1 or 0.3.                                                       |
+| Captions lag behind the speaker               | Lower `--rule2-silence` and `--rule3-utterance`.                                             |
+| Sentences split in the middle                 | Raise `--rule2-silence` and `--min-silence`.                                                 |
+| CPU usage is high                             | Add `--int8`.                                                                                |
+| Speaker changes are missed                    | Lower `--scd-threshold`; check that a checkpoint is supplied with `--scd-checkpoint`.        |
+| Speaker lines split too often                 | Raise `--scd-threshold` or `--scd-min-gap`.                                                  |
+| Speaker split boundaries feel early or late   | Tune `--scd-right-guard` and `--asr-decode-lag`; both affect the alignment/latency tradeoff. |
 
 ## Troubleshooting
 
