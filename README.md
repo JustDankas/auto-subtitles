@@ -4,7 +4,7 @@ https://github.com/user-attachments/assets/6837a0d1-6bed-48a7-9a77-81059e85f098
 
 
 
-# Stream ASR
+# Stream SCD ASR
 
 Real-time subtitles for any audio playing on your Windows PC. Runs offline on the CPU.
 
