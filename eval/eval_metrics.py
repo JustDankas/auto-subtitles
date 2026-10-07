@@ -65,7 +65,7 @@ def evaluate_predictions(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate SCD model predictions.")
-    parser.add_argument("--results-dir", type=Path, required=True, help="Directory containing CSV results from harness")
+    parser.add_argument("--results-dir", type=Path, default="results", help="Directory containing CSV results from harness")
     parser.add_argument("--algorithm", type=str, default="scd_classifier", help="Algorithm name prefix")
     parser.add_argument("--collar-s", type=float, default=0.25, help="Tolerance collar in seconds (default: 0.25s)")
     args = parser.parse_args()

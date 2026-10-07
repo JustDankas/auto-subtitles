@@ -185,33 +185,13 @@ class SCDClassifierDetector(SpeakerChangeDetector):
         return events
 
 
-# ---------------------------------------------------------------------------
-# Stubs for other detectors
-# ---------------------------------------------------------------------------
-class AdjacentWindowDetector(SpeakerChangeDetector):
-    def reset(self) -> None: raise NotImplementedError
-    def process_chunk(self, chunk: np.ndarray, chunk_start_s: float) -> List[BoundaryEvent]: raise NotImplementedError
-
-class VADCentroidDetector(SpeakerChangeDetector):
-    reset = process_chunk = lambda self, *a, **kw: None
-
-class SemanticEndpointDetector(SpeakerChangeDetector):
-    reset = process_chunk = lambda self, *a, **kw: None
-
-class CosineBaselineDetector(SpeakerChangeDetector):
-    reset = process_chunk = lambda self, *a, **kw: None
-
 class NoOpDetector(SpeakerChangeDetector):
     def reset(self) -> None: pass
     def process_chunk(self, chunk: np.ndarray, chunk_start_s: float) -> List[BoundaryEvent]: return []
 
 
 ALGORITHM_REGISTRY: Dict[str, Type[SpeakerChangeDetector]] = {
-    "adjacent_window": AdjacentWindowDetector,
     "scd_classifier": SCDClassifierDetector,
-    "vad_centroid": VADCentroidDetector,
-    "semantic_endpoint": SemanticEndpointDetector,
-    "cosine_baseline": CosineBaselineDetector,
     "noop": NoOpDetector,
 }
 

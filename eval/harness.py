@@ -12,10 +12,6 @@ It also derives ground-truth speaker-change timestamps from your manifest CSV
 and writes them once to ground_truth_boundaries.csv, for later use by a
 metrics script (Section 0.3).
 
-This file contains NO algorithm-specific logic -- swapping which of the 4
-plans (or the baseline) you're testing is purely a --algorithm flag. See
-detectors.py for the actual (currently stubbed) implementations.
-
 Example usage
 -------------
 # 1. Validate the harness itself before any model is wired up:
@@ -25,22 +21,6 @@ python harness.py \\
     --audio-dir ./wavs \\
     --output-dir ./results/noop
 
-# 2. Plan 1, once implemented, with a specific hyperparameter config:
-python harness.py \\
-    --algorithm adjacent_window \\
-    --manifest manifest.csv --audio-dir ./wavs --output-dir ./results/adj_window \\
-    --config '{"left_ms": 500, "right_ms": 500, "hop_ms": 100, "threshold": 0.3}'
-
-# 3. Plan 4 wrapping Plan 3, once both are implemented:
-python harness.py \\
-    --algorithm semantic_endpoint \\
-    --manifest manifest.csv --audio-dir ./wavs --output-dir ./results/sem_over_vad \\
-    --config '{"base_algorithm": "vad_centroid",
-                "base_config": {"silence_gap_ms": 200, "update_threshold": 0.75},
-                "gate_granularity": "word", "max_wait_ms": 500}'
-
-# Load hyperparameters from a file instead of an inline string:
-python harness.py --algorithm vad_centroid ... --config-file configs/vad_centroid_v1.json
 """
 
 from __future__ import annotations
