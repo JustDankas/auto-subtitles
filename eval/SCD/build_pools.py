@@ -79,6 +79,7 @@ def process_split(
     max_clip_s=15.0,
     seed=42,
     gender_map=None,
+    max_speakers=None,
 ):
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir) / split_name
@@ -96,6 +97,11 @@ def process_split(
             speakers_dict[spk_id] = files
 
     spk_list = sorted(list(speakers_dict.keys()))
+
+    # Truncate speaker list if max_speakers is provided
+    if max_speakers is not None and max_speakers > 0:
+        spk_list = spk_list[:max_speakers]
+
     spk_genders = np.array([gender_map.get(spk, "U") for spk in spk_list], dtype="S1")
 
     print(
@@ -190,6 +196,7 @@ def process_split(
         "split": split_name,
         "seed": seed,
         "speakers_count": len(spk_list),
+        "max_speakers": max_speakers,
         "clips_count": len(clip_spk),
         "total_samples": int(total_samples),
         "total_hours": round(total_hours, 3),
@@ -215,6 +222,7 @@ def build_pools(
     max_clip_s=10.0,
     seed=42,
     speakers_txt=None,
+    max_speakers=None,
 ):
     splits_path = Path(splits_json)
     with open(splits_path, "r", encoding="utf-8") as f:
@@ -233,6 +241,7 @@ def build_pools(
         "clips_per_spk": clips_per_spk,
         "min_clip_s": min_clip_s,
         "max_clip_s": max_clip_s,
+        "max_speakers": max_speakers,
         "speakers_txt": str(Path(speakers_txt).resolve()) if speakers_txt else None,
     }
     with open(out_base / "meta.json", "w", encoding="utf-8") as f:
@@ -249,6 +258,7 @@ def build_pools(
                 max_clip_s=max_clip_s,
                 seed=seed,
                 gender_map=gender_map,
+                max_speakers=max_speakers,
             )
 
 
@@ -259,6 +269,7 @@ if __name__ == "__main__":
     parser.add_argument("--clips_per_spk", type=int, default=48)
     parser.add_argument("--min_clip_s", type=float, default=3.5)
     parser.add_argument("--max_clip_s", type=float, default=10.0)
+    parser.add_argument("--max_speakers", type=int, default=None, help="Maximum number of speakers per split to include.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--speakers_txt", default="C:/src/data/LibriSpeech/SPEAKERS.txt", help="Path to LibriSpeech SPEAKERS.TXT for gender metadata.")
     args = parser.parse_args()
@@ -269,6 +280,7 @@ if __name__ == "__main__":
         clips_per_spk=args.clips_per_spk,
         min_clip_s=args.min_clip_s,
         max_clip_s=args.max_clip_s,
+        max_speakers=args.max_speakers,
         seed=args.seed,
         speakers_txt=args.speakers_txt,
     )
