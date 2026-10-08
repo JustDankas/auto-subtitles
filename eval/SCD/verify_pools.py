@@ -107,7 +107,7 @@ def verify_pools(pools_dir="./data/pools", seed=42):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verify audio pool integrity and disjointness.")
-    parser.add_argument("--pools_dir", default="./data/pools")
+    parser.add_argument("--pools_dir", default="C:/src/data/pools")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
