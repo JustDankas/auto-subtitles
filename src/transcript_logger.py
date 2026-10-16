@@ -16,6 +16,7 @@ from typing import Optional
 class TranscriptLogger:
     def __init__(self, jsonl_path: str):
         self.path = Path(jsonl_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "a", encoding="utf-8")
 
     def log(
