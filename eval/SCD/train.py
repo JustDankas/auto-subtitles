@@ -507,9 +507,9 @@ def train_model(
         if ema and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
         if "rng" in ckpt:
-            torch.set_rng_state(ckpt["rng"]["torch"])
+            torch.set_rng_state(ckpt["rng"]["torch"].cpu().to(torch.uint8))
             np.random.set_state(ckpt["rng"]["numpy"])
-            random.set_state(ckpt["rng"]["python"])
+            random.setstate(ckpt["rng"]["python"])
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = f"scdnet_{run_id}_blocks{len(dilations)}_k{kernel_size}_causal{causal}_dense{dense}"
@@ -714,13 +714,13 @@ def train_model(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Train SCDNet with step-based schedule and EMA.")
-    p.add_argument("--work_dir", type=str, required=True)
+    p.add_argument("--work_dir", type=str, default="./")
     p.add_argument("--train_pool_dir", type=str, default="C:/src/data/pools/train", help="dir with pool.npy + index.npz")
     p.add_argument("--val_pool_dir", type=str, default="C:/src/data/pools/val", help="used only if val npz files don't exist yet")
     p.add_argument("--val_clean_path", type=str, default="C:/src/data/pools/val_clean.npz", help="default: <work_dir>/val_clean.npz")
     p.add_argument("--val_aug_path", type=str, default="C:/src/data/pools/val_aug.npz", help="default: <work_dir>/val_aug.npz")
     p.add_argument("--bank_dir", type=str, default="C:/src/data/aug_banks", help="Directory containing bank folders (e.g. ./data/aug_banks)")
-    p.add_argument("--val_size", type=int, default=3000)
+    p.add_argument("--val_size", type=int, default=5000)
     p.add_argument("--select_on", type=str, choices=["aug", "clean"], default="aug", help="Selection metric set")
     p.add_argument("--total_steps", type=int, default=100_000)
     p.add_argument("--eval_every", type=int, default=2000)
